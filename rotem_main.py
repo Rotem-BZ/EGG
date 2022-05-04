@@ -20,7 +20,7 @@ class EmbeddingClusterSender(nn.Module):
         self.tca = total_cards_amount
         self.embeddings, self.word_index_dict, self.index_word_dict = rotem_utils.create_embedder(embedding_method)
         assert self.tca > 4
-        self.cluster_amounts = [self.tca - 1, self.tca - 2, self.tca - 3]   # TODO: find better function
+        self.cluster_amounts = [self.tca - 1, self.tca - 2, self.tca - 3]  # TODO: find better function
         self.good_embeds = None
         self.bad_embeds = None
 
@@ -29,7 +29,7 @@ class EmbeddingClusterSender(nn.Module):
 
     def find_closest_word(self, centroid, verbose: bool = False) -> str:
         t0 = time.perf_counter()
-        norm_dif = torch.norm(self.embeddings - centroid, dim=1)
+        norm_dif = torch.norm(self.embeddings[:-1] - centroid, dim=1)
         index = torch.argmin(norm_dif).item()
         closest_word = self.index_word_dict[index]
         if verbose:
@@ -44,10 +44,11 @@ class EmbeddingClusterSender(nn.Module):
             data = torch.cat([self.good_embeds, self.bad_embeds], dim=0)
             centroids, labels = kmeans2(data, cluster_amount)
             labels = torch.from_numpy(labels)
-            good_cluster_labels = set(labels[:self.gca]) - set(labels[self.gca:])
+            good_cluster_labels = set(labels[:self.gca].tolist()) - set(labels[self.gca:].tolist())
             for label in good_cluster_labels:
                 indices = (labels == label).nonzero(as_tuple=True)[0]
                 if len(indices) > largest_cluster_size:
+                    largest_cluster_size = len(indices)
                     largest_cluster_indices = indices
                     largest_cluster_centroid = centroids[label]
         if largest_cluster_size == 0:
@@ -73,6 +74,41 @@ class EmbeddingClusterSender(nn.Module):
         return clue_word, clue_len
 
 
+class ExhaustiveSearchSender(nn.Module):
+    def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe', **kwargs):
+        super(ExhaustiveSearchSender, self).__init__()
+        self.embeddings, self.word_index_dict, self.index_word_dict = rotem_utils.create_embedder(embedding_method)
+
+    def embedder(self, word: str):
+        return self.embeddings[self.word_index_dict.get(word, -1)]
+
+    def forward(self, words: tuple, verbose: bool = False):
+        """
+        words = (good_words, bad_words), which are lists of strings.
+        """
+        good_words, bad_words = words
+        g_embeds_list = list(map(self.embedder, good_words))
+        good_embeds = torch.stack(g_embeds_list)
+        b_embeds_list = list(map(self.embedder, bad_words))
+        bad_embeds = torch.stack(b_embeds_list)
+
+        good_diff = torch.norm(self.embeddings.unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
+        bad_diff = torch.norm(self.embeddings.unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
+
+        closest_bad_distance = bad_diff.min(dim=1, keepdim=True)[0]  # distance to the closest bad card - shape (N, 1)
+        boolean_closeness_mat = (good_diff < closest_bad_distance)
+        close_good_cards = boolean_closeness_mat.sum(dim=1)  # amount of good cards that are closer than the closest
+        # bad card - shape (N_vocab)
+
+        best_word_cluesize, best_word_idx = torch.max(close_good_cards, 0)
+        clue_word = self.index_word_dict[best_word_idx.item()]
+        if verbose:
+            cluster_words_indices = boolean_closeness_mat[best_word_idx].nonzero(as_tuple=True)[0]
+            print(f"For the {best_word_cluesize.item()} "
+                  f"good word: \n \t {[good_words[i] for i in cluster_words_indices]}\n \t The chosen clue is {clue_word}")
+        return clue_word, best_word_cluesize.item()
+
+
 class EmbeddingNearestReceiver(nn.Module):
     def __init__(self, embedding_method: str = 'GloVe'):
         super(EmbeddingNearestReceiver, self).__init__()
@@ -87,8 +123,8 @@ class EmbeddingNearestReceiver(nn.Module):
         """
         clue_word, clue_amount = clue
         clue_array = self.embedder(clue_word)
-        words = torch.stack(list(map(self.embedder, words)))
-        norm_dif = torch.norm(words - clue_array, dim=1)
+        words_array = torch.stack(list(map(self.embedder, words)))
+        norm_dif = torch.norm(words_array - clue_array, dim=1)
         _, indices = torch.topk(norm_dif, clue_amount, largest=False)
         return {words[i] for i in indices}
 
@@ -113,16 +149,18 @@ class CodenameDataLoader:
 
 def main():
     gca = 4
-    tca = 8
+    tca = 15
     embedding_method = 'GloVe'
 
-    sender = EmbeddingClusterSender(tca, gca, embedding_method)
+    sender = ExhaustiveSearchSender(tca, gca, embedding_method)
     receiver = EmbeddingNearestReceiver(embedding_method)
     dataloader = CodenameDataLoader(tca, gca, embedding_method)
     for sender_input, receiver_input in dataloader:
         print(f"receiver_input - all words: {receiver_input}\n")
         print(f"sender input:\n \tgood words: \t {sender_input[0]}\n \tbad words: \t {sender_input[1]}")
+        t0 = time.perf_counter()
         clue = sender(sender_input, verbose=True)
+        print("sender time:", time.perf_counter() - t0)
         choice = receiver(receiver_input, clue)
         print("receiver choice:", choice)
         break
