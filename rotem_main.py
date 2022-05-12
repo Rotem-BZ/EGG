@@ -13,18 +13,12 @@ from scipy.cluster.vq import kmeans2
 import time
 
 
-class EmbeddingClusterSender(nn.Module):
-    def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe'):
-        super(EmbeddingClusterSender, self).__init__()
-        self.gca = good_cards_amount
-        self.tca = total_cards_amount
-        self.embeddings, self.word_index_dict, self.index_word_dict = rotem_utils.create_embedder(embedding_method)
+class EmbeddingClusterSender(rotem_utils.EmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str):
+        super(EmbeddingClusterSender, self).__init__(total_cards, good_cards, embedding_method, vocab_method)
         self.cluster_amounts = [self.tca // (i + 1) for i in range(4)]
         self.good_embeds = None
         self.bad_embeds = None
-
-    def embedder(self, word: str):
-        return self.embeddings[self.word_index_dict.get(word, -1)]
 
     def find_closest_word(self, centroid, words, verbose: bool = False) -> str:
         t0 = time.perf_counter()
@@ -74,13 +68,9 @@ class EmbeddingClusterSender(nn.Module):
         return clue_word, clue_len
 
 
-class ExhaustiveSearchSender(nn.Module):
-    def __init__(self, embedding_method: str = 'GloVe', **kwargs):
-        super(ExhaustiveSearchSender, self).__init__()
-        self.embeddings, self.word_index_dict, self.index_word_dict = rotem_utils.create_embedder(embedding_method)
-
-    def embedder(self, word: str):
-        return self.embeddings[self.word_index_dict.get(word, -1)]
+class ExhaustiveSearchSender(rotem_utils.EmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str):
+        super(ExhaustiveSearchSender, self).__init__(total_cards, good_cards, embedding_method, vocab_method)
 
     def forward(self, words: tuple, verbose: bool = False):
         """
@@ -98,25 +88,22 @@ class ExhaustiveSearchSender(nn.Module):
         closest_bad_distance = bad_diff.min(dim=1, keepdim=True)[0]  # distance to the closest bad card - shape (N, 1)
         boolean_closeness_mat = (good_diff < closest_bad_distance)
         close_good_cards = boolean_closeness_mat.sum(dim=1)  # amount of good cards that are closer than the closest
-        close_good_cards[[self.word_index_dict[word] for word in good_words + bad_words]] = 0
         # bad card - shape (N_vocab)
+        close_good_cards[[self.word_index_dict[word] for word in good_words + bad_words]] = 0   # to avoid
 
         best_word_cluesize, best_word_idx = torch.max(close_good_cards, 0)
         clue_word = self.index_word_dict[best_word_idx.item()]
         if verbose:
             cluster_words_indices = boolean_closeness_mat[best_word_idx].nonzero(as_tuple=True)[0]
-            print(f"For the {best_word_cluesize.item()} "
-                  f"good word: \n \t {[good_words[i] for i in cluster_words_indices]}\n \t The chosen clue is {clue_word}")
+            # print(f"For the {best_word_cluesize.item()} "
+            #       f"good word: \n \t {[good_words[i] for i in cluster_words_indices]}\n \t The chosen clue is {clue_word}")
+            print(f"target words: {sorted([good_words[i] for i in cluster_words_indices])} \n \t guess: {clue_word}")
         return clue_word, best_word_cluesize.item()
 
 
-class EmbeddingNearestReceiver(nn.Module):
-    def __init__(self, embedding_method: str = 'GloVe'):
-        super(EmbeddingNearestReceiver, self).__init__()
-        self.embeddings, self.word_index_dict, self.index_word_dict = rotem_utils.create_embedder(embedding_method)
-
-    def embedder(self, word: str):
-        return self.embeddings[self.word_index_dict.get(word, -1)]
+class EmbeddingNearestReceiver(rotem_utils.EmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str):
+        super(EmbeddingNearestReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab_method)
 
     def forward(self, words: List[str], clue: tuple):
         """
@@ -131,8 +118,12 @@ class EmbeddingNearestReceiver(nn.Module):
 
 
 class CodenameDataLoader:
-    def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe', **kwargs):
-        self.vocab = rotem_utils.get_vocabulary(embedding_method)
+    def __init__(self, total_cards_amount: int, good_cards_amount: int, embed_method: str = 'GloVe',
+                 vocab_method: str = 'wordnet-nouns'):
+        """
+        Note: the embed_method is only used to filter the vocabulary in this class.
+        """
+        *_, self.vocab = rotem_utils.get_embedder_with_vocab(embed_method, vocab_method)
         self.vocab_length = len(self.vocab)
         self.random_mask = torch.zeros(self.vocab_length)
         self.random_mask[:1000] = 1
@@ -140,33 +131,92 @@ class CodenameDataLoader:
         self.tca = total_cards_amount
 
     def __iter__(self):
-        indices = torch.multinomial(torch.ones(self.vocab_length), self.tca)
-        words = [self.vocab[i] for i in indices]
-        g_words, b_words = words[:self.gca], words[self.gca:]
-        sender_input = (g_words, b_words)
-        receiver_input = random.sample(words, len(words))
-        yield sender_input, receiver_input
+        while True:
+            indices = torch.multinomial(torch.ones(self.vocab_length), self.tca)
+            words = [self.vocab[i] for i in indices]
+            # words = ['inspector', 'suggestion', 'police', 'emphasis', 'member', 'meal', 'two', 'independence', 'addition',
+            #          'person', 'hall', 'love', 'shopping', 'presentation', 'director']
+
+            g_words, b_words = words[:self.gca], words[self.gca:]
+            sender_input = (g_words, b_words)
+            receiver_input = random.sample(words, len(words))   # shuffled words
+            yield sender_input, receiver_input
 
 
-def main():
-    gca = 4
-    tca = 15
+class TrainableSender(rotem_utils.EmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str):
+        super(TrainableSender, self).__init__(total_cards, good_cards, embedding_method, vocab_method)
+        self.vocab_size = len(self.word_index_dict)
+        self.fc = nn.Linear(100, self.vocab_size)
+
+    def forward(self, x, aux_input=None):
+        print(f"sender inputs: \n \t x: {x} \n \t aux: {aux_input} \n \n")
+        return None
+
+
+class TrainableReceiver(rotem_utils.EmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str, input_size: int):
+        super(TrainableReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab_method)
+        self.fc = nn.Linear(input_size, 10)     # 10 tbd
+
+    def forward(self, channel_input, receiver_input, aux_input=None):
+        print(f"Receiver inputs: \n \t channel_input: {channel_input} \n \t receiver_input: {receiver_input}"
+              f" \n \t aux: {aux_input} \n \n")
+        return None
+
+
+def skyline_main():
+    gca = 10
+    tca = 20
     embedding_method = 'GloVe'
+    vocab_method = 'wordnet-nouns'
+    kwargs = dict(total_cards=tca, good_cards=gca, embedding_method=embedding_method, vocab_method=vocab_method)
+    trial_amount = 6
 
-    sender = ExhaustiveSearchSender(embedding_method)
-    # sender = EmbeddingClusterSender(tca, gca, embedding_method)
-    receiver = EmbeddingNearestReceiver(embedding_method)
-    dataloader = CodenameDataLoader(tca, gca, embedding_method)
+    sender = ExhaustiveSearchSender(**kwargs)
+    # sender = EmbeddingClusterSender(**kwargs)
+    receiver = EmbeddingNearestReceiver(**kwargs)
+    dataloader = CodenameDataLoader(tca, gca, embedding_method, vocab_method)
+    i=0
     for sender_input, receiver_input in dataloader:
-        print(f"receiver_input - all words: {receiver_input}\n")
-        print(f"sender input:\n \tgood words: \t {sender_input[0]}\n \tbad words: \t {sender_input[1]}")
+        # print(f"receiver_input - all words: {receiver_input}\n")
+        # print(f"sender input:\n \tgood words: \t {sender_input[0]}\n \tbad words: \t {sender_input[1]}")
+        print(f"\tgood words: \t {sender_input[0]}\n \tbad words: \t {sender_input[1]}")
         t0 = time.perf_counter()
         clue = sender(sender_input, verbose=True)
         print("sender time:", time.perf_counter() - t0)
         choice = receiver(receiver_input, clue)
-        print("receiver choice:", choice)
-        break
+        print("guess:", sorted(choice), "\n\n")
+        i += 1
+        if i == trial_amount:
+            break
 
+
+def main():
+    gca = 4
+    tca = 10
+    embedding_method = 'GloVe'
+    vocab_method = 'wordnet-nouns'
+    rec_input_size = 400
+    kwargs = dict(total_cards=tca, good_cards=gca, embedding_method=embedding_method, vocab_method=vocab_method)
+    opts = core.init(params=['--random_seed=7',  # will initialize numpy, torch, and python RNGs
+                             '--lr=1e-3',  # sets the learning rate for the selected optimizer
+                             '--batch_size=32',
+                             '--optimizer=adam'])
+
+    train_loader = CodenameDataLoader(tca, gca, embedding_method, vocab_method)
+    test_loader = CodenameDataLoader(tca, gca, embedding_method, vocab_method)
+    sender = TrainableSender(**kwargs)
+    vocab_size = sender.vocab_size
+    sender = core.GumbelSoftmaxWrapper(sender, temperature=1.0)
+    receiver = TrainableReceiver(**kwargs, input_size=rec_input_size)
+    receiver = core.SymbolReceiverWrapper(receiver, vocab_size, agent_input_size=rec_input_size)
+
+    game = core.SymbolGameGS(sender, receiver, rotem_utils.try_ce_loss)
+    optimizer = torch.optim.Adam(game.parameters())
+    trainer = core.Trainer(game=game, optimizer=optimizer, train_data=train_loader, validation_data=test_loader,
+                           callbacks=[core.TemperatureUpdater(agent=sender, decay=0.9, minimum=0.1)])
+    trainer.train(n_epochs=1)
 
 if __name__ == '__main__':
-    main()
+    skyline_main()
