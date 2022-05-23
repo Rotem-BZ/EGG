@@ -3,17 +3,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 import numpy as np
+import pandas as pd
 import pickle
 import time
 import os
 from os.path import join, isdir, isfile
 from tqdm import tqdm
+
 import nltk
 from nltk.corpus import words, wordnet as wn
-
-import pandas as pd
 import gensim.downloader as api
-
+from transformers import BertTokenizer, BertModel
 
 # global variable - name of embedding savings directory
 embedding_saves_dir = "embeddings_saved"
@@ -26,7 +26,7 @@ def load_saved_embedding(file_name):
         os.mkdir(embedding_saves_dir)
         return None
 
-    if not isfile(path := join(embedding_saves_dir, file_name)):    # no file file_name in the directory
+    if not isfile(path := join(embedding_saves_dir, file_name)):  # no file file_name in the directory
         return None
 
     with open(path, "rb") as read_file:
@@ -90,6 +90,16 @@ def initiate_word2vec(save_data=True):
     return w2v_data
 
 
+def initiate_bert(save_data=True):
+    """ some of the code taken from
+    https://github.com/arushiprakash/MachineLearning/blob/main/BERT%20Word%20Embeddings.ipynb
+    """
+    model = BertModel.from_pretrained('bert-base-uncased', output_hidden_states=True)
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    # TODO: implement everything
+    raise NotImplementedError
+
+
 def create_embedder(method: str):
     if method == 'GloVe':
         x = load_saved_embedding(glove_embeddings_file)
@@ -104,9 +114,9 @@ def create_embedder(method: str):
         else:
             embeddings, word_indexing_dict = x
     else:
-        raise ValueError("currently, only GloVe and word2vec embedding are allowed")
+        raise ValueError("currently, only GloVe and word2vec embeddings are allowed")
 
-    index_word_dict = {v:k for k,v in word_indexing_dict.items()}
+    index_word_dict = {v: k for k, v in word_indexing_dict.items()}
 
     return embeddings, word_indexing_dict, index_word_dict
 
@@ -132,8 +142,36 @@ def get_vocabulary(method: str):
         # taken from https://www.kaggle.com/datasets/leite0407/list-of-nouns
         return ['atm'] + np.char.lower(pd.read_csv('nounlist.csv').to_numpy().reshape(-1).astype(str)).tolist()
 
+    if method == 'codenames-words':
+        return [
+            'vacuum', 'whip', 'moon', 'school', 'tube', 'lab', 'key', 'table', 'lead', 'crown',
+            'bomb', 'bug', 'pipe', 'roulette', 'australia', 'play', 'cloak', 'piano', 'beijing', 'bison',
+            'boot', 'cap', 'car', 'change', 'circle', 'cliff', 'conductor', 'cricket', 'death', 'diamond',
+            'figure', 'gas', 'germany', 'india', 'jupiter', 'kid', 'king', 'lemon', 'litter', 'nut',
+            'phoenix', 'racket', 'row', 'scientist', 'shark', 'stream', 'swing', 'unicorn', 'witch', 'worm',
+            'pistol', 'saturn', 'rock', 'superhero', 'mug', 'fighter', 'embassy', 'cell', 'state', 'beach',
+            'capital', 'post', 'cast', 'soul', 'tower', 'green', 'plot', 'string', 'kangaroo', 'lawyer', 'fire',
+            'robot', 'mammoth', 'hole', 'spider', 'bill', 'ivory', 'giant', 'bar', 'ray', 'drill', 'staff',
+            'greece', 'press', 'pitch', 'nurse', 'contract', 'water', 'watch', 'amazon', 'spell', 'kiwi', 'ghost',
+            'cold', 'doctor', 'port', 'bark', 'foot', 'luck', 'nail', 'ice', 'needle', 'disease', 'comic', 'pool',
+            'field', 'star', 'cycle', 'shadow', 'fan', 'compound', 'heart', 'flute', 'millionaire', 'pyramid', 'africa',
+            'robin', 'chest', 'casino', 'fish', 'oil', 'alps', 'brush', 'march', 'mint', 'dance', 'snowman', 'torch',
+            'round', 'wake', 'satellite', 'calf', 'head', 'ground', 'club', 'ruler', 'tie', 'parachute', 'board',
+            'paste', 'lock', 'knight', 'pit', 'fork', 'egypt', 'whale', 'scale', 'knife', 'plate', 'scorpion', 'bottle',
+            'boom', 'bolt', 'fall', 'draft', 'hotel', 'game', 'mount', 'train', 'air', 'turkey', 'root', 'charge',
+            'space', 'cat', 'olive', 'mouse', 'ham', 'washer', 'pound', 'fly', 'server', 'shop', 'engine', 'himalayas',
+            'box', 'antarctica', 'shoe', 'tap', 'cross', 'rose', 'belt', 'thumb', 'gold', 'point', 'opera', 'pirate',
+            'tag', 'olympus', 'cotton', 'glove', 'sink', 'carrot', 'jack', 'suit', 'glass', 'spot', 'straw', 'well',
+            'pan', 'octopus', 'smuggler', 'grass', 'dwarf', 'hood', 'duck', 'jet', 'mercury',
+        ]
+
     _a, word_indexing_dict, _b = create_embedder(method)
     return list(word_indexing_dict.keys())
+
+
+def intersect_vocabularies(*vocabs):
+    voc_generator = map(get_vocabulary, vocabs)
+    return list(set(next(voc_generator)).intersection(*voc_generator))
 
 
 def get_embedder_with_vocab(embed_method: str = 'GloVe', vocab_method: str = 'wordnet-nouns'):
@@ -149,7 +187,7 @@ def get_embedder_with_vocab(embed_method: str = 'GloVe', vocab_method: str = 'wo
               f" \'{embed_method}\'embedding. Total of {len(vocab)} words")
         vocab_indices = [word_indexing_dict[word] for word in vocab]
         embeddings = embeddings[vocab_indices + [-1]]
-        word_indexing_dict = {v:i for i,v in enumerate(vocab)}
+        word_indexing_dict = {v: i for i, v in enumerate(vocab)}
         index_word_dict = {i: v for i, v in enumerate(vocab)}
 
         dump_embeddings(filename, (embeddings, word_indexing_dict, index_word_dict, vocab))
@@ -185,6 +223,9 @@ class EmbeddingAgent(nn.Module):
 
     def embedder(self, word: str):
         return self.embeddings[self.word_index_dict.get(word, -1)]
+
+    def known_word(self, word: str):
+        return word in self.word_index_dict
 
 
 def try_ce_loss(sender_input, _message, _receiver_input, receiver_output, _labels, _aux_input=None):
