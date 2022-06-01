@@ -5,20 +5,23 @@ from torch.nn import functional as F
 import numpy as np
 import pandas as pd
 import pickle
+import math
 import time
 import os
 from os.path import join, isdir, isfile
 from tqdm import tqdm
+from typing import List
 
 import nltk
 from nltk.corpus import words, wordnet as wn
 import gensim.downloader as api
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, BertForMaskedLM
 
 # global variable - name of embedding savings directory
 embedding_saves_dir = "embeddings_saved"
 glove_embeddings_file = "saved_glove_embeddings.pkl"
 word2vec_embeddings_file = "saved_w2v_embeddings.pkl"
+pretrained_LM: tuple = ()    # Can be a single BERT instance used by all the agents instead of multiple BERTs
 
 
 def load_saved_embedding(file_name):
@@ -90,14 +93,43 @@ def initiate_word2vec(save_data=True):
     return w2v_data
 
 
-def initiate_bert(save_data=True):
-    """ some of the code taken from
-    https://github.com/arushiprakash/MachineLearning/blob/main/BERT%20Word%20Embeddings.ipynb
+def initiate_bert():
     """
-    model = BertModel.from_pretrained('bert-base-uncased', output_hidden_states=True)
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    # TODO: implement everything
-    raise NotImplementedError
+    fetch the model and tokenizer
+    """
+    global pretrained_LM
+    if not pretrained_LM:
+        model = BertForMaskedLM.from_pretrained('bert-base-uncased', output_hidden_states=True)
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', output_hidden_states=True)
+        pretrained_LM = (model, tokenizer)
+    return pretrained_LM
+
+
+def bert_multiple_context_emb(model, tokenizer, word_list: List[str], context: str):
+    """
+    Embed each word using the context. The sentence inputted to the model is "context word".
+    Parameters
+    ----------
+    model
+        for example, BERT model for maskedLM
+    tokenizer
+        the corresponding tokenizer
+    word_list
+        list of strings to embed
+    context
+        string used as context
+
+    Returns
+    -------
+    embedding matrix (len_words, embed_dim)
+    """
+    clue_tokenization = len(tokenizer.tokenize(context))
+    texts = [f"{context} {word}" for word in word_list]
+    model_input = tokenizer(texts, padding=True, return_tensors='pt')
+    with torch.no_grad():
+        outputs = model(**model_input)
+        embeddings = outputs['hidden_states'][-1][:, 1 + clue_tokenization, :]
+    return embeddings
 
 
 def create_embedder(method: str):
@@ -170,6 +202,7 @@ def get_vocabulary(method: str):
 
 
 def intersect_vocabularies(*vocabs):
+    vocabs = [x for x in vocabs if x != 'bert']
     voc_generator = map(get_vocabulary, vocabs)
     return list(set(next(voc_generator)).intersection(*voc_generator))
 
@@ -206,6 +239,56 @@ def triple_restricted_vocab(embed_method_1: str, embed_method_2: str, vocab_meth
     return result
 
 
+def BiSANLM_score(model, tokenizer, sentence: str):
+    """ http://proceedings.mlr.press/v101/shin19a/shin19a.pdf """
+    mask_id = tokenizer.convert_tokens_to_ids(['[MASK]'])[0]
+    tokenized_ids = tokenizer(sentence, return_tensors='pt')['input_ids'].view(-1)
+    labels = tokenized_ids[1:-1]
+    tokens_amount = len(tokenized_ids) - 2
+    arange = torch.arange(tokens_amount)
+    input_matrix = torch.vstack([tokenized_ids]*tokens_amount)  # (tokens_amount, tokens_amount + 2)
+    input_matrix[arange, arange + 1] = mask_id
+    with torch.inference_mode():
+        outputs = model(input_matrix)['logits']     # (tokens_amount, tokens_amount + 2, V)
+    # take the masked entries
+    outputs = outputs[arange, arange + 1, :]  # (tokens_amount, V)
+    # log likelihood
+    outputs = F.log_softmax(outputs, dim=1)
+    scores = outputs[arange, labels]
+    return scores.sum().item()
+
+
+def ce_score(model, tokenizer, sentence: str):
+    tokenized_ids = tokenizer(sentence, return_tensors='pt')['input_ids']
+    with torch.inference_mode():
+        outputs = model(tokenized_ids)['logits']
+    score = F.cross_entropy(outputs.squeeze(), tokenized_ids.squeeze())
+    return -score
+
+
+def bert_sentence_scorer(model, tokenizer, w1: str, w2: str, method: str = 'ce'):
+    assert method in ['ce', 'BiS'], f"illegal method {method}"
+    score_func = {'ce': ce_score, 'BiS': BiSANLM_score}[method]
+    templates = [
+        f"{w1} is a type of {w2}",
+        f"{w2} is a type of {w1}",
+        f"you can find {w1} in {w2}",
+        f"you can find {w2} in {w1}",
+        f"{w1} and {w2} are types of [MASK]",
+        f"{w1} {w2}",
+        f"{w2} {w1}",
+        f"{w1} is a synonym of {w2}"
+    ]
+    best_score = None
+    arg_best = None
+    for sent in templates:
+        score = score_func(model, tokenizer, sent)
+        if best_score is None or score > best_score:
+            best_score = score
+            arg_best = sent
+    return arg_best, best_score
+
+
 class EmbeddingAgent(nn.Module):
     def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe',
                  vocab_method: str = 'wordnet-nouns', dist_metric: str = 'l2'):
@@ -221,16 +304,44 @@ class EmbeddingAgent(nn.Module):
             embedding_norms = torch.norm(self.embeddings, dim=-1, keepdim=True)
             self.embeddings = self.embeddings / embedding_norms
 
-    def embedder(self, word: str):
-        return self.embeddings[self.word_index_dict.get(word, -1)]
+    def embedder(self, word: List[str] or str):
+        if isinstance(word, str):
+            return self.embeddings[self.word_index_dict.get(word, -1)]
+        elif isinstance(word, list):
+            indices = [self.word_index_dict.get(w, -1) for w in word]
+            return self.embeddings[indices]
+        else:
+            raise ValueError
 
     def known_word(self, word: str):
         return word in self.word_index_dict
 
 
-def try_ce_loss(sender_input, _message, _receiver_input, receiver_output, _labels, _aux_input=None):
-    loss = F.binary_cross_entropy(receiver_output, sender_input.view(-1, 784), reduction='none').mean(dim=1)
-    return loss, {}
+class ContextEmbeddingAgent(nn.Module):
+    """
+    Currently the vocab_method input to this class is unused, and the vocabulary is BERT's tokens.
+    """
+    def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'bert',
+                 vocab_method: str = 'wordnet-nouns', dist_metric: str = 'l2'):
+        super(ContextEmbeddingAgent, self).__init__()
+        assert embedding_method == 'bert', "currently only bert can be used for contextualized embedding"
+        self.gca = good_cards_amount
+        self.tca = total_cards_amount
+        self.model, self.tokenizer = initiate_bert()
+        self.normalize_embeds = dist_metric == 'cosine_sim'
+
+    def embedder(self, word: List[str] or str, context: str):
+        if isinstance(word, str):
+            word = [word]
+        result = bert_multiple_context_emb(self.model, self.tokenizer, word, context)
+        if self.normalize_embeds:
+            embedding_norms = torch.norm(result, dim=-1, keepdim=True)
+            result = result / embedding_norms
+        return result
+
+    @staticmethod
+    def known_word(word: str):
+        return True
 
 #########################
 

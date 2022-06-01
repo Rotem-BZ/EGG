@@ -1,3 +1,4 @@
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -58,10 +59,8 @@ class EmbeddingClusterSender(rotem_utils.EmbeddingAgent):
         words = (good_words, bad_words), which are lists of strings.
         """
         good_words, bad_words = words
-        g_embeds_list = list(map(self.embedder, good_words))
-        self.good_embeds = torch.stack(g_embeds_list)
-        b_embeds_list = list(map(self.embedder, bad_words))
-        self.bad_embeds = torch.stack(b_embeds_list)
+        self.good_embeds = self.embedder(good_words)
+        self.bad_embeds = self.embedder(bad_words)
 
         centroid, indices, clue_len = self.largest_good_cluster()
         clue_word = self.find_closest_word(centroid, good_words + bad_words, verbose=verbose)
@@ -106,10 +105,8 @@ class ExhaustiveSearchSender(rotem_utils.EmbeddingAgent):
         words = (good_words, bad_words), which are lists of strings.
         """
         good_words, bad_words = words
-        g_embeds_list = list(map(self.embedder, good_words))
-        good_embeds = torch.stack(g_embeds_list)
-        b_embeds_list = list(map(self.embedder, bad_words))
-        bad_embeds = torch.stack(b_embeds_list)
+        good_embeds = self.embedder(good_words)
+        bad_embeds = self.embedder(bad_words)
 
         good_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
         bad_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
@@ -152,8 +149,23 @@ class EmbeddingNearestReceiver(rotem_utils.EmbeddingAgent):
         """
         clue_word, clue_amount = clue
         clue_array = self.embedder(clue_word)
-        words_array = torch.stack(list(map(self.embedder, words)))
+        words_array = self.embedder(words)
         norm_dif = torch.norm(words_array - clue_array, dim=1)
+        _, indices = torch.topk(norm_dif, clue_amount, largest=False)
+        return {words[i] for i in indices}
+
+
+class ContextualizedReceiver(rotem_utils.ContextEmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str, dist_metric: str):
+        super(ContextualizedReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab_method,
+                                                     dist_metric)
+
+    def forward(self, words: List[str], clue: tuple):
+        clue_word, clue_amount = clue
+        clue_array = self.embedder(clue_word, context=clue_word).view(-1)    # (768)
+        assert len(clue_array.shape) == 1
+        words_array = self.embedder(words, context=clue_word)       # (N_words, 768)
+        norm_dif = torch.norm(words_array - clue_array, dim=1)      # (N_word)
         _, indices = torch.topk(norm_dif, clue_amount, largest=False)
         return {words[i] for i in indices}
 
@@ -189,8 +201,8 @@ class CodenameDataLoader:
         return word in self.vocab
 
 
-def skyline_main(tca, gca, sender_type, sender_emb_method, receiver_emb_method, agent_vocab, board_vocab, dist_metric,
-                 trial_amount, exhaustibe_tiebreak=None, verbose=False):
+def skyline_main(tca, gca, sender_type, sender_emb_method, receiver_type, receiver_emb_method, agent_vocab, board_vocab,
+                 dist_metric, trial_amount, exhaustive_tiebreak=None, verbose=False):
     """
     run many (trial_amount) experiment games and collect data, for evaluations.
 
@@ -200,6 +212,7 @@ def skyline_main(tca, gca, sender_type, sender_emb_method, receiver_emb_method, 
     gca - good cards amount
     sender_type - 'exhaustive' or 'cluster', which sender class to use
     sender_emb_method - 'GloVe' or 'word2vec'
+    receiver_type - 'embedding' or 'context'
     receiver_emb_method - 'GloVe' or 'word2vec'
     agent_vocab - 'GloVe' or 'word2vec' or 'nltk-words' or 'wordnet-nouns' or 'nouns-kaggle'
     board_vocab - 'GloVe' or 'word2vec' or 'nltk-words' or 'wordnet-nouns' or 'nouns-kaggle'
@@ -212,14 +225,15 @@ def skyline_main(tca, gca, sender_type, sender_emb_method, receiver_emb_method, 
     -------
 
     """
-    assert sender_type != 'exhaustive' or exhaustibe_tiebreak is not None, "exhaustive sender must receive tiebreak"
+    assert sender_type != 'exhaustive' or exhaustive_tiebreak is not None, "exhaustive sender must receive tiebreak"
     kwargs = dict(total_cards=tca, good_cards=gca, vocab_method=agent_vocab, dist_metric=dist_metric)
 
     sender_class = {'exhaustive': ExhaustiveSearchSender, 'cluster': EmbeddingClusterSender}[sender_type]
-    sender_extra_kwargs = {'tie_break_method': exhaustibe_tiebreak} if sender_type == 'exhaustive' else {}
+    sender_extra_kwargs = {'tie_break_method': exhaustive_tiebreak} if sender_type == 'exhaustive' else {}
     sender = sender_class(**kwargs, **sender_extra_kwargs, embedding_method=sender_emb_method)
 
-    receiver = EmbeddingNearestReceiver(**kwargs, embedding_method=receiver_emb_method)
+    receiver_class = {'embedding': EmbeddingNearestReceiver, 'context': ContextualizedReceiver}[receiver_type]
+    receiver = receiver_class(**kwargs, embedding_method=receiver_emb_method)
     dataloader = CodenameDataLoader(tca, gca, sender_emb_method, receiver_emb_method, agent_vocab, board_vocab)
     dataloader = iter(dataloader)
 
@@ -270,7 +284,7 @@ def skyline_main(tca, gca, sender_type, sender_emb_method, receiver_emb_method, 
         Agent vocabulary restriction: {agent_vocab}
         Board vocabulary restriction: {board_vocab}
         Distance/similarity metric: {dist_metric}
-        Tiebreak (if exhaustive sender): {exhaustibe_tiebreak} \n\n
+        Tiebreak (if exhaustive sender): {exhaustive_tiebreak} \n\n
         Avg. clue size: {sum(clue_sizes) / len(clue_sizes)}
         Avg. receiver accuracy: {sum(accuracies) / len(accuracies)}
         Avg. optimal amount (if exhaustive sender): {sum(optimal_amounts) / len(optimal_amounts)
@@ -285,7 +299,7 @@ def interactive_game():
     defaults = {'tca': 5, 'gca': 2, 'agent_vocab': 'wordnet-nouns', 'board_vocab': 'codenames-words',
                 'dist_metric': 'cosine_sim'}
     game1_defaults = {'sender_type': 'exhaustive', 'sender_embedding': 'GloVe', 'tie_break_method': 'red_blue_diff'}
-    game2_defaults = {'receiver_embedding': 'GloVe'}
+    game2_defaults = {'receiver_type': 'embedding', 'receiver_embedding': 'GloVe'}
     print("This is an interactive codenames game. You have two options: \n"
           "1) Guess words using a clue generated by our sender \n"
           "2) Choose a clue and give it to our receiver \n \n")
@@ -358,10 +372,17 @@ def interactive_game():
     else:  # game_choice == '2'
         if defaults_choice:
             emb_method = defaults['receiver_embedding']
+            receiver_type = defaults['receiver_type']
         else:
-            emb_method = rotem_utils.user_choice('GloVe', "receiver embedding method", options=['GloVe', 'word2vec'])
+            receiver_type = rotem_utils.user_choice(defaults['receiver_type'], "receiver type",
+                                                    options=['embedding', 'context'])
+            if receiver_type == 'embedding':
+                emb_method = rotem_utils.user_choice('GloVe', "receiver embedding method", options=['GloVe', 'word2vec'])
+            else:
+                emb_method = 'bert'
         dataloader = CodenameDataLoader(tca, gca, emb_method, emb_method, agent_vocab, board_vocab)
-        receiver = EmbeddingNearestReceiver(**kwargs, embedding_method=emb_method)
+        receiver_class = {'embedding': EmbeddingNearestReceiver, 'context': ContextualizedReceiver}[receiver_type]
+        receiver = receiver_class(**kwargs, embedding_method=emb_method)
         for sender_input, receiver_input in dataloader:
             print(f"\tgood words: \t {sender_input[0]}\n \tbad words: \t {sender_input[1]}")
             print("What is your clue? \n")
@@ -380,14 +401,68 @@ def interactive_game():
                 break
 
 
+def synthetic_sender_round(good_words: list, bad_words: list, sender_type: str, emb_method: str,
+                           vocab: str, dist_metric: str, exhaustive_tiebreak: str):
+    assert sender_type != 'exhaustive' or exhaustive_tiebreak is not None, "exhaustive sender must receive tiebreak"
+    kwargs = dict(total_cards=len(good_words) + len(bad_words), good_cards=len(good_words),
+                  vocab_method=vocab, dist_metric=dist_metric)
+    sender_class = {'exhaustive': ExhaustiveSearchSender, 'cluster': EmbeddingClusterSender}[sender_type]
+    sender_extra_kwargs = {'tie_break_method': exhaustive_tiebreak} if sender_type == 'exhaustive' else {}
+    sender = sender_class(**kwargs, **sender_extra_kwargs, embedding_method=emb_method)
+    sender_input = (good_words, bad_words)
+    clue_word, clue_size, targets, extra_data = sender(sender_input, verbose=False)
+    print(f"\t clue: \t {clue_word} \n \t for: \t {targets} \n \t extra data \t {extra_data}")
+
+
+def synthetic_receiver_round(receiver_type: str, good_words: list, bad_words: list, targets: list, clue: str,
+                             emb_method: str, vocab: str, dist_metric: str):
+    kwargs = dict(total_cards=len(good_words) + len(bad_words), good_cards=len(good_words),
+                  vocab_method=vocab, dist_metric=dist_metric, embedding_method=emb_method)
+    receiver_class = {'embedding': EmbeddingNearestReceiver, 'context': ContextualizedReceiver}[receiver_type]
+    receiver = receiver_class(**kwargs)
+    receiver_input = good_words + bad_words
+    choice = receiver(receiver_input, (clue, len(targets)))
+    print(f"\t clue: \t {clue} \n \t for: \t {targets} \n \t the receiver chose \t {choice}")
+
+
 if __name__ == '__main__':
     # clue_words, clue_sizes, sender_times, receiver_times, accuracies = skyline_main(tca=10, gca=3,
-    #                                                                                 sender_type='cluster',
-    #                                                                                 exhaustibe_tiebreak='red_blue_diff',
+    #                                                                                 sender_type='exhaustive',
+    #                                                                                 exhaustive_tiebreak='red_blue_diff',
     #                                                                                 sender_emb_method='GloVe',
-    #                                                                                 receiver_emb_method='word2vec',
+    #                                                                                 receiver_type='context',
+    #                                                                                 receiver_emb_method='bert',
     #                                                                                 agent_vocab='wordnet-nouns',
     #                                                                                 board_vocab='codenames-words',
     #                                                                                 dist_metric='cosine_sim',
     #                                                                                 trial_amount=100, verbose=True)
+
     interactive_game()
+
+    # model, tokenizer = rotem_utils.initiate_bert()
+    # rotem_utils.bert_multiple_context_emb(model, tokenizer, word_list=['dog', 'cat'], context='well')
+
+    # synthetic_sender_round(good_words=['cat', 'dog', 'mouse'],
+    #                        bad_words=['electricity', 'stick', 'child'],
+    #                        sender_type='exhaustive', emb_method='GloVe', vocab='GloVe',
+    #                        dist_metric='cosine_sim', exhaustive_tiebreak='red_blue_diff')
+
+    # synthetic_receiver_round(receiver_type='context', good_words=['cat', 'dog', 'mouse'],
+    #                          bad_words=['electricity', 'stick', 'child'],
+    #                          clue='family',
+    #                          targets=['cat', 'dog'],
+    #                          emb_method='bert', vocab='GloVe',
+    #                          dist_metric='cosine_sim')
+
+    # model, tokenizer = rotem_utils.initiate_bert()
+    # ce_sentences = []
+    # BiS_sentences = []
+    # keys = [('cat', 'animal'), ('dollar', 'money'), ('monkey', 'banana'),
+    #                ('apple', 'eat'), ('star', 'space'), ('radical', 'movement'), ('banana', 'apple')]
+    # for w1, w2 in keys:
+    #     sent1, _ = rotem_utils.bert_sentence_scorer(model, tokenizer, w1, w2, method='BiS')
+    #     sent2, _ = rotem_utils.bert_sentence_scorer(model, tokenizer, w1, w2, method='ce')
+    #     BiS_sentences.append(sent1)
+    #     ce_sentences.append(sent2)
+    # df = pd.DataFrame({'ce': ce_sentences, 'BiS': BiS_sentences}, index=keys)
+    # print(df)
