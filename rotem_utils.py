@@ -4,6 +4,7 @@ from torch.nn import functional as F
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import pickle
 import math
 import time
@@ -11,6 +12,7 @@ import os
 from os.path import join, isdir, isfile
 from tqdm import tqdm
 from typing import List
+from collections import defaultdict
 
 import nltk
 from nltk.corpus import words, wordnet as wn
@@ -342,47 +344,51 @@ def few_shot_huggingface(prompt: str, delimiter: str = "###"):
         return response.json()[0]['generated_text'][len(prompt):]
 
 
-def learn_translation_matrix(from_embedding: str, to_embedding: str, lr=0.01, epochs=5):
+def learn_translation_matrix(f_embedding: torch.Tensor, t_embedding: torch.Tensor, lr=0.001, epochs=15, plot=False):
     # learn translation matrix by gradient descent
-    f_embedding, f_word_idx_dict, f_index_word_dict, vocab1 = get_embedder_with_vocab(from_embedding, vocab_method=to_embedding)
-    t_embedding, t_word_idx_dict, t_index_word_dict, vocab2 = get_embedder_with_vocab(to_embedding, vocab_method=from_embedding)
-    assert vocab1 == vocab2, f"{len(vocab1)=}, {len(vocab2)=}"
     n, d1 = f_embedding.shape
     _, d2 = t_embedding.shape
 
-    translation_mat = nn.Linear(d1, d2, bias=False)
+    # translation_mat = nn.Linear(d1, d2, bias=False)
+    translation_mat = nn.Sequential(
+        nn.Linear(d1, 300, bias=False),
+        nn.ReLU(),
+        nn.Linear(300, 300),
+        nn.ReLU(),
+        nn.Linear(300, 300),
+        nn.ReLU(),
+        nn.Linear(300, 300),
+        nn.ReLU(),
+        nn.Linear(300, d2)
+    )
     optimizer = torch.optim.SGD(translation_mat.parameters(), lr=lr)
     batch_size = 40
-    losses = []
+    losses = defaultdict(list)
     for epoch in range(epochs):
-        print("epoch " + str(epoch))
+        if epoch == epochs // 2:
+            batch_size = 100
+        print(f"epoch {epoch} / {epochs}")
         optimizer.zero_grad()
-        for i, word in tqdm(enumerate(vocab1)):
-            from_index = f_word_idx_dict[word]
-            from_vector = f_embedding[from_index]
-            to_index = t_word_idx_dict[word]
-            to_vector = t_embedding[to_index]
-            output = translation_mat(from_vector)
-            loss = torch.norm(output - to_vector)
+        for i in range(n // batch_size):
+            from_vectors = f_embedding[batch_size*i: batch_size*(i+1)].clone()
+            to_vectors = t_embedding[batch_size*i: batch_size*(i+1)].clone()
+            output = translation_mat(from_vectors)
+            loss = torch.norm(output - to_vectors)
+            loss /= from_vectors.shape[0]
             loss.backward()
-            losses.append(loss.item())
-            if i+1 % batch_size == 0:
-                optimizer.step()
-        if len(vocab1) % batch_size != 0:
+            losses[f"epoch_{epoch}"].append(loss.item())
             optimizer.step()
-    return translation_mat.weight
-
-
-def find_translation_matrix(from_embedding: str, to_embedding: str):
-    # find translation matrix by the closed solution.
-    # This assumes the embedding matrices have the exact same vocab and in the same order.
-    f_embedding, f_word_idx_dict, f_index_word_dict, vocab1 = get_embedder_with_vocab(from_embedding,
-                                                                                      vocab_method=to_embedding)
-    t_embedding, t_word_idx_dict, t_index_word_dict, vocab2 = get_embedder_with_vocab(to_embedding,
-                                                                                      vocab_method=from_embedding)
-    assert vocab1 == vocab2, f"{len(vocab1)=}, {len(vocab2)=}"
-    T = torch.linalg.lstsq(f_embedding, t_embedding)[0]
-    return T
+    if plot:
+        iteration = 0
+        for epoch, loss_vals in losses.items():
+            plt.scatter(range(iteration, iteration + len(loss_vals)), loss_vals, label=epoch)
+            iteration += len(loss_vals)
+        plt.title("loss plot")
+        plt.xlabel("iteration")
+        plt.ylabel("loss")
+        # plt.legend()
+        plt.show()
+    return translation_mat
 
 
 class EmbeddingAgent(nn.Module):
@@ -392,7 +398,7 @@ class EmbeddingAgent(nn.Module):
     the `embedder` function to turn str (or List[str]) to word embedding(s).
     """
     def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe',
-                 vocab: list = None, dist_metric: str = 'l2'):
+                 vocab: list = None, dist_metric: str = 'cosine_sim', translate_to: str = None):
         super(EmbeddingAgent, self).__init__()
         self.gca = good_cards_amount
         self.tca = total_cards_amount
@@ -405,6 +411,8 @@ class EmbeddingAgent(nn.Module):
             # further change is needed.
             embedding_norms = torch.norm(self.embeddings, dim=-1, keepdim=True)
             self.embeddings = self.embeddings / embedding_norms
+        if translate_to is not None:
+            self.translate_embedding(translate_to)
 
     def embedder(self, word: List[str] or str):
         if isinstance(word, str):
@@ -425,12 +433,19 @@ class EmbeddingAgent(nn.Module):
                 return
             other_array, *_ = get_embedder_list_vocab(other_embedding, self.vocab)
         elif isinstance(other_embedding, torch.Tensor):
-            other_array = other_embedding
+            other_array = other_embedding.clone().detach()
         else:
             raise ValueError(f"illegal type {type(other_embedding)}, should be str or Tensor")
-        T = torch.linalg.lstsq(self.embeddings, other_array)[0]
-        print(f"translating {self.embedding_method} to {other_embedding}. T shape is {T.shape}")
-        self.embeddings = self.embeddings @ T
+        # # option 1 - closed LS solution
+        # T = torch.linalg.lstsq(self.embeddings, other_array)[0]
+        # self.embeddings = self.embeddings @ T
+        ###
+        # option 2 - learnable MLP
+        T = learn_translation_matrix(self.embeddings, other_array, plot=True)
+        self.embeddings = T(self.embeddings)
+        ###
+        print(f"manually calculated final loss value: {torch.norm(self.embeddings - other_array)}")
+        # print(f"translating {self.embedding_method} to {other_embedding}. T shape is {T.shape}")
 
 
 class ContextEmbeddingAgent(nn.Module):
@@ -438,7 +453,7 @@ class ContextEmbeddingAgent(nn.Module):
     Currently the vocab_method input to this class is unused, and the vocabulary is BERT's tokens.
     """
     def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'bert',
-                 vocab_method: str = 'wordnet-nouns', dist_metric: str = 'l2'):
+                 vocab: list = None, dist_metric: str = 'l2'):
         super(ContextEmbeddingAgent, self).__init__()
         self.gca = good_cards_amount
         self.tca = total_cards_amount
@@ -457,6 +472,28 @@ class ContextEmbeddingAgent(nn.Module):
     @staticmethod
     def known_word(word: str):
         return True
+
+
+def average_rank_embedding_distance(agent1: EmbeddingAgent, agent2: EmbeddingAgent, vocab: list = None):
+    if vocab is None:
+        assert agent1.vocab == agent2.vocab, "can only compare embeddings with the same vocabulary unless given one"
+        vocab = agent1.vocab
+    N = len(vocab)
+    embedding1 = agent1.embedder(vocab)
+    embedding2 = agent2.embedder(vocab)
+    diff = 0
+    for i in tqdm(range(N), total=N):
+        word_array = embedding1[i]
+        norm_diff = torch.norm(embedding1 - word_array, dim=1)
+        sorted_indices_1 = norm_diff.argsort()
+
+        word_array = embedding2[i]
+        norm_diff = torch.norm(embedding2 - word_array, dim=1)
+        sorted_indices_2 = norm_diff.argsort()
+        diff += (sorted_indices_1 - sorted_indices_2).abs().sum() / N
+    diff = diff / N
+    return diff
+
 
 #########################
 

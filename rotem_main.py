@@ -3,6 +3,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 import rotem_utils
+# from evaluation_measures import plot_given_board, receiver_API, evaluate_agent
+import evaluation_measures as EvalMeasures
 
 import random
 from itertools import product
@@ -13,6 +15,7 @@ import time
 from tqdm import tqdm
 from dataclasses import dataclass
 import pandas as pd
+import math
 
 
 class EmbeddingClusterSender(rotem_utils.EmbeddingAgent):
@@ -120,6 +123,18 @@ class EmbeddingClusterSender(rotem_utils.EmbeddingAgent):
 
         return clue_word, clue_len, sorted(targets), {}
 
+    def ranked_forward(self, words: tuple, verbose: bool = False):
+        good_words, bad_words = words
+        self.good_embeds = self.embedder(good_words)
+        self.bad_embeds = self.embedder(bad_words)
+
+        centroid, *_ = self.largest_good_cluster()
+        norm_diff = torch.norm(self.embeddings - centroid, dim=1)
+        sorted_indices = norm_diff.argsort()
+        sorted_vocabulary = [self.vocab[i] for i in sorted_indices]
+
+        return sorted_vocabulary
+
 
 class ExhaustiveSearchSender(rotem_utils.EmbeddingAgent):
     """
@@ -179,7 +194,6 @@ class ExhaustiveSearchSender(rotem_utils.EmbeddingAgent):
                                      torch.zeros(best_good_diff.shape, dtype=torch.float))
         scores = self.tie_break_scores(best_good_diff, closest_bad_distance.view(-1))
         best_word_idx = torch.argmin(scores)  # index of best word among optimals
-        best_word_idx = 0  ############################ TODELETE #####################
         best_word_idx = all_best_indices[best_word_idx]  # that word's index in the entire vocabulary
 
         clue_word = self.index_word_dict[best_word_idx.item()]
@@ -187,6 +201,76 @@ class ExhaustiveSearchSender(rotem_utils.EmbeddingAgent):
         cluster_words_indices = boolean_closeness_mat[best_word_idx].nonzero(as_tuple=True)[0]
         targets = sorted([good_words[i] for i in cluster_words_indices])
         return clue_word, best_word_cluesize.item(), targets, {'optimal_amount': len(all_best_indices)}
+
+    def ranked_forward(self, words: tuple, verbose: bool = False):
+        """
+        words = (good_words, bad_words), which are lists of strings.
+        """
+        good_words, bad_words = words
+        good_embeds = self.embedder(good_words)
+        bad_embeds = self.embedder(bad_words)
+
+        good_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
+        bad_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
+
+        closest_bad_distance = bad_diff.min(dim=1, keepdim=True)[0]  # distance to the closest bad card - shape (N, 1)
+        boolean_closeness_mat = (good_diff < closest_bad_distance)
+        close_good_cards = boolean_closeness_mat.sum(dim=1)  # amount of good cards that are closer than the closest
+        # bad card - shape (N_vocab)
+        close_good_cards[[self.word_index_dict[word] for word in good_words + bad_words]] = 0  # avoid current cards
+
+        # tiebreak - choose the best option among the optimal clues ####################
+        all_best_indices = torch.nonzero(close_good_cards == close_good_cards.max()).view(-1)
+        best_word_cluesize = close_good_cards[all_best_indices[0]]
+        # print("amount of optimal clues:", len(all_best_indices))
+        best_good_diff = good_diff[all_best_indices]
+        closest_bad_distance = closest_bad_distance[all_best_indices]
+        best_good_diff = torch.where(best_good_diff < closest_bad_distance,
+                                     best_good_diff,
+                                     torch.zeros(best_good_diff.shape, dtype=torch.float))
+        scores = self.tie_break_scores(best_good_diff, closest_bad_distance.view(-1))
+        all_indices = close_good_cards.sort(descending=True)[1]
+        optimal_permutation = scores.sort()[1]
+        all_indices[:len(all_best_indices)] = all_indices[:len(all_best_indices)][optimal_permutation]
+        sorted_vocabulary = [self.vocab[i] for i in all_indices]
+
+        return sorted_vocabulary
+
+
+class CompletelyRandomSender(rotem_utils.EmbeddingAgent):
+    """
+    A sender agent which operates as follows - given good and bad cards, finds the set of all words in the vocabulary
+    with maximal amount of good cards closer than all bad cards. Out of this set, the agent chosses the word which is
+    closest to it's matching good cards.
+    """
+
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab: list, dist_metric: str):
+        super(CompletelyRandomSender, self).__init__(total_cards, good_cards, embedding_method, vocab, dist_metric)
+
+    def forward(self, words: tuple, verbose: bool = False):
+        """
+        words = (good_words, bad_words), which are lists of strings.
+        """
+        good_words, bad_words = words
+        sample = random.sample(self.vocab, len(good_words) + len(bad_words) + 1)
+        clue_word = None
+        for word in sample:
+            if word not in good_words + bad_words:
+                clue_word = word
+                break
+        clue_size = random.sample(range(len(good_words) + len(bad_words)), 1)[0] + 1
+        targets = random.sample(good_words, clue_size)
+
+        return clue_word, clue_size, sorted(targets), {}
+
+    def ranked_forward(self, words: tuple, verbose: bool = False):
+        """
+        words = (good_words, bad_words), which are lists of strings.
+        """
+        good_words, bad_words = words
+        sorted_vocabulary = random.sample(self.vocab, len(self.vocab))
+
+        return sorted_vocabulary
 
 
 class EmbeddingNearestReceiver(rotem_utils.EmbeddingAgent):
@@ -204,11 +288,42 @@ class EmbeddingNearestReceiver(rotem_utils.EmbeddingAgent):
         _, indices = torch.topk(norm_dif, clue_amount, largest=False)
         return [words[i] for i in indices]
 
+    def ranked_forward(self, words: List[str], clue: tuple):
+        """
+        words is a shuffled list of all words, clue is a tuple (word, number).
+        """
+        clue_word, clue_amount = clue
+        clue_array = self.embedder(clue_word)
+        words_array = self.embedder(words)
+        norm_diff = torch.norm(words_array - clue_array, dim=1)
+        sorted_indices = norm_diff.argsort()
+        sorted_vocabulary = [words[i] for i in sorted_indices]
+        return sorted_vocabulary
+
+
+class CompletelyRandomReceiver(rotem_utils.EmbeddingAgent):
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab: list, dist_metric: str):
+        super(CompletelyRandomReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab, dist_metric)
+
+    def forward(self, words: List[str], clue: tuple):
+        """
+        words is a shuffled list of all words, clue is a tuple (word, number).
+        """
+        clue_word, clue_amount = clue
+        choice = random.sample(words, clue_amount)
+        return choice
+
+    def ranked_forward(self, words: List[str], clue: tuple):
+        """
+        words is a shuffled list of all words, clue is a tuple (word, number).
+        """
+        shuffle = random.sample(words, len(words))
+        return shuffle
+
 
 class ContextualizedReceiver(rotem_utils.ContextEmbeddingAgent):
-    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab_method: str, dist_metric: str):
-        super(ContextualizedReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab_method,
-                                                     dist_metric)
+    def __init__(self, total_cards: int, good_cards: int, embedding_method: str, vocab: list, dist_metric: str):
+        super(ContextualizedReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab, dist_metric)
 
     def forward(self, words: List[str], clue: tuple):
         clue_word, clue_amount = clue
@@ -221,7 +336,8 @@ class ContextualizedReceiver(rotem_utils.ContextEmbeddingAgent):
 
 
 class CodenameDataLoader:
-    def __init__(self, total_cards_amount: int, good_cards_amount: int, agent_vocab: list, board_vocab: str = 'wordnet-nouns'):
+    def __init__(self, total_cards_amount: int, good_cards_amount: int, agent_vocab: list,
+                 board_vocab: str = 'wordnet-nouns'):
         """
         Note: the embed_methods are only used to filter the vocabulary in this class.
         """
@@ -233,12 +349,15 @@ class CodenameDataLoader:
 
     def __iter__(self):
         while True:
-            indices = torch.multinomial(torch.ones(self.vocab_length), self.tca)
-            words = [self.vocab[i] for i in indices]
-            g_words, b_words = words[:self.gca], words[self.gca:]
-            sender_input = (g_words, b_words)
-            receiver_input = random.sample(words, len(words))  # shuffled words
-            yield sender_input, receiver_input
+            yield next(self)
+
+    def __next__(self):
+        indices = torch.multinomial(torch.ones(self.vocab_length), self.tca)
+        words = [self.vocab[i] for i in indices]
+        g_words, b_words = words[:self.gca], words[self.gca:]
+        sender_input = (g_words, b_words)
+        receiver_input = random.sample(words, len(words))  # shuffled words
+        return sender_input, receiver_input
 
     def legal_word(self, word):
         return word in self.vocab
@@ -267,7 +386,7 @@ class CodenamesOptions:
     gca: int = 3
     sender_type: str = 'exhaustive'
     exhaustive_tiebreak: str = 'red_blue_diff'  # for exhaustive sender
-    reduction_method: str = 'centroid'          # for cluster sender
+    reduction_method: str = 'centroid'  # for cluster sender
     sender_emb_method: str = 'GloVe'
     sender_linear_translation: bool = False
     receiver_type: str = 'embedding'
@@ -284,14 +403,15 @@ class CodenamesOptions:
     def __post_init__(self):
         # assertions - type and legal choice checking
         int_inputs = ['tca', 'gca']
-        str_inputs = ['sender_type', 'exhaustive_tiebreak', 'reduction_method', 'sender_emb_method', 'receiver_type', 'receiver_emb_method',
+        str_inputs = ['sender_type', 'exhaustive_tiebreak', 'reduction_method', 'sender_emb_method', 'receiver_type',
+                      'receiver_emb_method',
                       'agent_vocab', 'board_vocab', 'dist_metric']
         bool_inputs = ['verbose', 'sender_linear_translation', 'receiver_linear_translation']
-        legal_str_options = {'sender_type': ['exhaustive', 'cluster'],
+        legal_str_options = {'sender_type': ['exhaustive', 'cluster', 'random'],
                              'exhaustive_tiebreak': ['avg_blue_dist', 'max_blue_dist', 'max_radius', 'red_blue_diff'],
                              'reduction_method': ['centroid', 'few-shot', 'fusion'],
                              'sender_emb_method': ['GloVe', 'word2vec'],
-                             'receiver_type': ['embedding', 'context'],
+                             'receiver_type': ['embedding', 'context', 'random'],
                              'receiver_emb_method': ['GloVe', 'word2vec', 'bert', 'deberta'],
                              'agent_vocab': ['GloVe', 'word2vec', 'nltk-words', 'wordnet-nouns',
                                              'nouns-kaggle', 'codenames-words'],
@@ -307,30 +427,42 @@ class CodenamesOptions:
                         f"choose {attr} from {legal_str_options[attr]}. Not an option: {attr_values[attr]}"
 
         # find common vocabulary for Sender and Receiver
-        self.intersected_agent_vocab = rotem_utils.intersect_vocabularies(self.agent_vocab, self.sender_emb_method, self.receiver_emb_method)
+        self.intersected_agent_vocab = rotem_utils.intersect_vocabularies(self.agent_vocab, self.sender_emb_method,
+                                                                          self.receiver_emb_method)
+        print(f"intersected_agent_vocab received types {type(self.agent_vocab)}, {type(self.sender_emb_method)},"
+              f" {type(self.receiver_emb_method)} and values: \n {self.agent_vocab} \n {self.sender_emb_method}"
+              f" \n {self.receiver_emb_method}")
 
     def _make_sender(self):
-        sender_class = {'exhaustive': ExhaustiveSearchSender, 'cluster': EmbeddingClusterSender}[self.sender_type]
+        sender_class = {'exhaustive': ExhaustiveSearchSender,
+                        'cluster': EmbeddingClusterSender,
+                        'random': CompletelyRandomSender}[self.sender_type]
         kwargs = dict(total_cards=self.tca, good_cards=self.gca, vocab=self.intersected_agent_vocab,
                       dist_metric=self.dist_metric, embedding_method=self.sender_emb_method)
         sender_extra_kwargs = {'exhaustive': {'tie_break_method': self.exhaustive_tiebreak},
-                               'cluster': {'reduction_method': self.reduction_method}
+                               'cluster': {'reduction_method': self.reduction_method},
+                               'random': {}
                                }[self.sender_type]
         self.sender_instance = sender_class(**kwargs, **sender_extra_kwargs)
         if self.sender_linear_translation:
-            receiver_embedding = self.receiver_emb_method if self.receiver_instance is None else self.receiver_instance.embeddings
+            # receiver_embedding = self.receiver_emb_method if self.receiver_instance is None else self.receiver_instance.embeddings
+            receiver_embedding = self.receiver_emb_method
             self.sender_instance.translate_embedding(receiver_embedding)
 
     def _make_receiver(self):
-        receiver_class = {'embedding': EmbeddingNearestReceiver, 'context': ContextualizedReceiver}[self.receiver_type]
+        receiver_class = {'embedding': EmbeddingNearestReceiver,
+                          'context': ContextualizedReceiver,
+                          'random': CompletelyRandomReceiver}[self.receiver_type]
         kwargs = dict(total_cards=self.tca, good_cards=self.gca, vocab=self.intersected_agent_vocab,
                       dist_metric=self.dist_metric, embedding_method=self.receiver_emb_method)
         receiver_extra_kwargs = {'embedding': {},
-                                 'context': {}
+                                 'context': {},
+                                 'random': {}
                                  }[self.receiver_type]
         self.receiver_instance = receiver_class(**kwargs, **receiver_extra_kwargs)
         if self.receiver_linear_translation:
-            sender_embedding = self.sender_emb_method if self.sender_instance is None else self.sender_instance.embeddings
+            # sender_embedding = self.sender_emb_method if self.sender_instance is None else self.sender_instance.embeddings
+            sender_embedding = self.sender_emb_method
             self.receiver_instance.translate_embedding(sender_embedding)
 
     def _make_dataloader(self):
@@ -355,11 +487,8 @@ class CodenamesOptions:
             self._make_dataloader()
         return self.dataloader_instance
 
-    def game_instance(self, iter_dataloader: bool = False):
-        dataloader = self.dataloader
-        if iter_dataloader:
-            dataloader = iter(dataloader)
-        return self.sender, self.receiver, dataloader
+    def game_instance(self):
+        return self.sender, self.receiver, self.dataloader
 
 
 def skyline_main(opts: CodenamesOptions, trial_amount: int = 50, verbose: bool = False):
@@ -418,7 +547,7 @@ def skyline_main(opts: CodenamesOptions, trial_amount: int = 50, verbose: bool =
 
 
 def interactive_game():
-    defaults = {'tca': 5, 'gca': 2, 'agent_vocab': 'wordnet-nouns', 'board_vocab': 'codenames-words',
+    defaults = {'tca': 6, 'gca': 2, 'agent_vocab': 'wordnet-nouns', 'board_vocab': 'codenames-words',
                 'dist_metric': 'cosine_sim'}
     game1_defaults = {'sender_type': 'exhaustive', 'sender_embedding': 'GloVe', 'tie_break_method': 'red_blue_diff'}
     game2_defaults = {'receiver_type': 'embedding', 'receiver_embedding': 'GloVe'}
@@ -492,19 +621,23 @@ def interactive_game():
             sender.translate_embedding(to_embedding)
 
         for sender_input, receiver_input in dataloader:
-            print(f"\n words on the board: \n {receiver_input} \n")
             clue, clue_num, targets, _ = sender(sender_input, verbose=False)
-            print(f"The sender gives the clue \"{clue}\", for {clue_num} words. Can you guess them?")
-            guesses = []
-            for i in range(clue_num):
-                guess = rotem_utils.user_choice('<stop>', f"guess number {i + 1}:", options=['<stop>'] + receiver_input,
-                                                full_text=True)
-                if guess == '<stop>':
-                    break
-                guesses.append(guess)
-            guesses.sort()
-            print(f"your guesses: \t {guesses} \n you got right: \t {[w for w in guesses if w in targets]} \n"
-                  f"you got wrong: \t {[w for w in guesses if w not in targets]} \n the true words: \t {targets}")
+            if tca in [4,6]:
+                EvalMeasures.receiver_API(words=receiver_input, num_choices=len(targets), clue=clue,
+                                          targets=targets, gt_good_words=sender_input[0])
+            else:
+                print(f"\n words on the board: \n {receiver_input} \n")
+                print(f"The sender gives the clue \"{clue}\", for {clue_num} words. Can you guess them?")
+                guesses = []
+                for i in range(clue_num):
+                    guess = rotem_utils.user_choice('<stop>', f"guess number {i + 1}:", options=['<stop>'] + receiver_input,
+                                                    full_text=True)
+                    if guess == '<stop>':
+                        break
+                    guesses.append(guess)
+                guesses.sort()
+                print(f"your guesses: \t {guesses} \n you got right: \t {[w for w in guesses if w in targets]} \n"
+                      f"you got wrong: \t {[w for w in guesses if w not in targets]} \n the true words: \t {targets}")
             answer = rotem_utils.user_choice('yes', "play again?", options=['yes', 'no'], full_text=True)
             if answer == 'no':
                 break
@@ -540,6 +673,10 @@ def interactive_game():
             receiver.translate_embedding(to_embedding)
         for sender_input, receiver_input in dataloader:
             print(f"\tgood words: \t {sender_input[0]}\n \tbad words: \t {sender_input[1]}")
+            if tca % 2 == 0:
+                EvalMeasures.plot_given_board(good_words=sender_input[0], bad_words=sender_input[1], grey_words=[])
+            else:
+                print(f"(can't plot boards with odd number of cards, here it's {tca=})")
             print("What is your clue? \n")
             while True:
                 clue = input()
@@ -618,32 +755,78 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
     return clue_words, guesses, targets_chosen, len(clue_words)
 
 
-def test_glove_w2v(tca=100, gca=40, sender_type='exhaustive', receiver_type='embedding', agent_vocab='codenames-words',
-                   board_vocab='codenames-words', dist_metric='cosine_sim', exhaustive_tiebreak='red_blue_diff'):
+# def test_glove_w2v(**opts_kwargs):
+#     avg_metrics = dict()
+#     combinations = list(product(['word2vec', 'word2vec_T', 'GloVe_T'], ['GloVe', 'GloVe_T', 'word2vec_T']))
+#     opts_w_g_t = CodenamesOptions(**opts_kwargs,
+#                                   sender_emb_method="word2vec",
+#                                   receiver_emb_method="GloVe",
+#                                   sender_linear_translation=True, receiver_linear_translation=True)
+#     W_sender_t = opts_w_g_t.sender
+#     G_receiver_t = opts_w_g_t.receiver
+#     opts_w_g = CodenamesOptions(**opts_kwargs,
+#                                 sender_emb_method="word2vec",
+#                                 receiver_emb_method="GloVe")
+#     W_sender = opts_w_g.sender
+#     G_receiver = opts_w_g.receiver
+#     opts_g_w_t = CodenamesOptions(**opts_kwargs,
+#                                   sender_emb_method="GloVe",
+#                                   receiver_emb_method="word2vec",
+#                                   sender_linear_translation=True, receiver_linear_translation=True)
+#     G_sender_t = opts_g_w_t.sender
+#     W_receiver_t = opts_g_w_t.receiver
+#     dataloader = iter(opts_w_g_t.dataloader)
+#
+#     for sender_embedding, receiver_embedding in combinations:
+#         print(f"calculating score for {sender_embedding} sender and {receiver_embedding} receiver")
+#         sender = {'word2vec': W_sender, 'word2vec_T': W_sender_t, 'GloVe_T': G_sender_t}[sender_embedding]
+#         receiver = {'GloVe': G_receiver, 'GloVe_T': G_receiver_t, 'word2vec_T': W_receiver_t}[receiver_embedding]
+#         metric_array = []
+#         for _ in tqdm(range(20)):
+#             (good_words, bad_words), _ = next(dataloader)
+#             *_, metric = game_metric(good_words=good_words, bad_words=bad_words,
+#                                      sender_instance=sender, receiver_instance=receiver)
+#             metric_array.append(metric)
+#         avg_metrics[(sender_embedding, receiver_embedding)] = sum(metric_array) / len(metric_array)
+#         print(
+#             f"for {sender_embedding} sender and {receiver_embedding} receiver: score {sum(metric_array) / len(metric_array)}")
+#     sender_embeds, receiver_embeds = zip(*combinations)
+#     metric_score = [avg_metrics[k] for k in combinations]
+#     df = pd.DataFrame({"Sender": sender_embeds, "Receiver": receiver_embeds, "metric(low=good)": metric_score})
+#     print(df)
+
+
+def experiment_glove_w2v(**opts_kwargs):
     avg_metrics = dict()
-    combinations = list(product(['GloVe', 'word2vec'], ['GloVe', 'word2vec']))
-    opts_g_w = CodenamesOptions(tca=tca, gca=gca, sender_type=sender_type, exhaustive_tiebreak=exhaustive_tiebreak,
-                                sender_emb_method="GloVe", receiver_type=receiver_type, receiver_emb_method="word2vec",
-                                agent_vocab=agent_vocab, board_vocab=board_vocab, dist_metric=dist_metric,
-                                sender_linear_translation=True, receiver_linear_translation=True)
-    G_sender = opts_g_w.sender
-    W_receiver = opts_g_w.receiver
-    dataloader = iter(opts_g_w.dataloader)
-    opts_w_g = CodenamesOptions(tca=tca, gca=gca, sender_type=sender_type, exhaustive_tiebreak=exhaustive_tiebreak,
-                                sender_emb_method="word2vec", receiver_type=receiver_type, receiver_emb_method="GloVe",
-                                agent_vocab=agent_vocab, board_vocab=board_vocab, dist_metric=dist_metric,
-                                sender_linear_translation=True, receiver_linear_translation=True)
-    W_sender = opts_w_g.sender
-    G_receiver = opts_w_g.receiver
+    combinations = list(product(['word2vec', 'word2vec_perturbed'], ['word2vec', 'word2vec_perturbed']))
+    opts_1 = CodenamesOptions(**opts_kwargs, receiver_type='embedding',
+                              sender_emb_method="word2vec", receiver_emb_method="word2vec", agent_vocab='word2vec')
+    opts_2 = CodenamesOptions(**opts_kwargs, receiver_type='embedding',
+                              sender_emb_method="word2vec", receiver_emb_method="word2vec", agent_vocab='word2vec')
+    W_sender = opts_1.sender
+    W_receiver = opts_1.receiver
+    W_sender_p = opts_2.sender
+    W_receiver_p = opts_2.receiver
+
+    word2vec_embedding_mat = W_sender_p.embeddings
+    noise = torch.rand(word2vec_embedding_mat.size(), dtype=word2vec_embedding_mat.dtype)
+    noise /= math.sqrt(word2vec_embedding_mat.shape[1])
+    word2vec_embedding_mat = word2vec_embedding_mat + noise
+
+    W_sender_p.embeddings = word2vec_embedding_mat
+    W_receiver_p.embeddings = word2vec_embedding_mat
+
+    dataloader = opts_1.dataloader
 
     for sender_embedding, receiver_embedding in combinations:
         print(f"calculating score for {sender_embedding} sender and {receiver_embedding} receiver")
-        sender = {'GloVe': G_sender, 'word2vec': W_sender}[sender_embedding]
-        receiver = {'GloVe': G_receiver, 'word2vec': W_receiver}[receiver_embedding]
+        sender = {'word2vec': W_sender, 'word2vec_perturbed': W_sender_p}[sender_embedding]
+        receiver = {'word2vec': W_receiver, 'word2vec_perturbed': W_receiver_p}[receiver_embedding]
         metric_array = []
-        for _ in tqdm(range(20)):
+        for _ in tqdm(range(5)):
             (good_words, bad_words), _ = next(dataloader)
-            *_, metric = game_metric(good_words, bad_words, sender_instance=sender, receiver_instance=receiver)
+            *_, metric = game_metric(good_words, bad_words, sender_instance=sender, receiver_instance=receiver,
+                                     sender_emb_method="word2vec", receiver_emb_method="word2vec", agent_vocab='word2vec')
             metric_array.append(metric)
         avg_metrics[(sender_embedding, receiver_embedding)] = sum(metric_array) / len(metric_array)
         print(f"for {sender_embedding} sender and {receiver_embedding} receiver: score {sum(metric_array) / len(metric_array)}")
@@ -665,7 +848,7 @@ if __name__ == '__main__':
     #                         dist_metric='cosine_sim')
     # clue_words, clue_sizes, sender_times, receiver_times, accuracies = skyline_main(opts, trial_amount=50, verbose=True)
 
-    test_glove_w2v(15, 5, agent_vocab='wordnet-nouns')
+    # experiment_glove_w2v(tca=20, gca=10)
 
     # interactive_game()
 
@@ -702,3 +885,36 @@ if __name__ == '__main__':
     # prompt = f"group: cat, dog, mouse. description: \"animals\" {delimiter} group:" \
     #          f" pants, shirt, hat. description: \"cloths\" {delimiter} group: one, two, three. description: "
     # print(rotem_utils.few_shot_huggingface(prompt, delimiter))
+
+    # opts1 = CodenamesOptions(sender_emb_method='GloVe', receiver_emb_method='word2vec', sender_linear_translation=True,
+    #                          tca=20, gca=10)
+    # sender = opts1.sender
+    # opts2 = CodenamesOptions(sender_emb_method='word2vec', receiver_emb_method='GloVe', receiver_linear_translation=True)
+    # receiver = opts2.receiver
+    # print("equal?", sender.vocab == receiver.vocab)
+    # (good_words, bad_words), all_words = next(iter(opts1.dataloader))
+    # *_, metric = game_metric(good_words=good_words, bad_words=bad_words, max_iter=100,
+    #                          sender_instance=sender, receiver_instance=receiver)
+    # print("metric:", metric)
+
+    tca = 20
+    gca = 10
+    vocab = rotem_utils.intersect_vocabularies('GloVe', 'word2vec', 'nouns-kaggle')
+    print("vocab size:", len(vocab))
+    agent_w2v = rotem_utils.EmbeddingAgent(tca, gca, 'word2vec', vocab=vocab)
+    agent_w2v_p = rotem_utils.EmbeddingAgent(tca, gca, 'word2vec', vocab=vocab)
+
+    word2vec_embedding_mat = agent_w2v_p.embeddings
+    noise = torch.rand(word2vec_embedding_mat.size(), dtype=word2vec_embedding_mat.dtype)
+    noise /= math.sqrt(word2vec_embedding_mat.shape[1])
+    agent_w2v_p.embeddings = word2vec_embedding_mat + noise
+
+    agent_glove = rotem_utils.EmbeddingAgent(tca, gca, 'GloVe', vocab=vocab)
+    agent_glove_translated = rotem_utils.EmbeddingAgent(tca, gca, 'GloVe', vocab=vocab, translate_to='word2vec')
+
+    d1 = rotem_utils.average_rank_embedding_distance(agent_w2v, agent_w2v_p)
+    d2 = rotem_utils.average_rank_embedding_distance(agent_w2v, agent_glove)
+    d3 = rotem_utils.average_rank_embedding_distance(agent_w2v, agent_glove_translated)
+    print(f"distance between word2vec and word2vec perturbed: {d1}")
+    print(f"distance between word2vec and GloVe: {d2}")
+    print(f"distance between word2vec and GloVe translated: {d3}")
