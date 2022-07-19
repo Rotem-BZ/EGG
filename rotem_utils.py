@@ -7,27 +7,24 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import pickle
 import math
-import time
 import os
 from os.path import join, isdir, isfile
 from tqdm import tqdm
-from typing import List
-from collections import defaultdict
+import json
+import requests
 
 import nltk
 from nltk.corpus import words, wordnet as wn
 import gensim.downloader as api
-from transformers import BertTokenizer, BertForMaskedLM, DebertaTokenizer, DebertaForMaskedLM
 
-import json
-import requests
+from agents import EmbeddingAgent, ContextEmbeddingAgent
 
-# global variable - name of embedding savings directory
+# global variables - names of directories and files
 embedding_saves_dir = "embeddings_saved"
 vocabs_saves_dir = "vocabs_saved"
 glove_embeddings_file = "saved_glove_embeddings.pkl"
 word2vec_embeddings_file = "saved_w2v_embeddings.pkl"
-pretrained_LM: tuple = ()    # Can be a single BERT instance used by all the agents instead of multiple BERTs
+ROTEM_RESULTS_DIR = 'rotem_results'
 
 
 def load_saved_data(file_name: str, directory: str):
@@ -101,52 +98,6 @@ def initiate_word2vec(save_data=True):
     return w2v_data
 
 
-def initiate_bert(lm_model: str = 'bert'):
-    """
-    fetch the model and tokenizer
-    """
-    global pretrained_LM
-    if not pretrained_LM:
-        if lm_model == 'bert':
-            model = BertForMaskedLM.from_pretrained('bert-base-uncased', output_hidden_states=True)
-            tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', output_hidden_states=True)
-            pretrained_LM = (model, tokenizer)
-        elif lm_model == 'deberta':
-            model = DebertaForMaskedLM.from_pretrained('microsoft/deberta-base', output_hidden_states=True)
-            tokenizer = DebertaTokenizer.from_pretrained('microsoft/deberta-base', output_hidden_states=True)
-            pretrained_LM = (model, tokenizer)
-        else:
-            raise ValueError(f"lm_model {lm_model} is not an option, choose from \'bert\' or \'deberta\'")
-    return pretrained_LM
-
-
-def bert_multiple_context_emb(model, tokenizer, word_list: List[str], context: str):
-    """
-    Embed each word using the context. The sentence inputted to the model is "context word".
-    Parameters
-    ----------
-    model
-        for example, BERT model for maskedLM
-    tokenizer
-        the corresponding tokenizer
-    word_list
-        list of strings to embed
-    context
-        string used as context
-
-    Returns
-    -------
-    embedding matrix (len_words, embed_dim)
-    """
-    clue_tokenization = len(tokenizer.tokenize(context))
-    texts = [f"{context} {word}" for word in word_list]
-    model_input = tokenizer(texts, padding=True, return_tensors='pt')
-    with torch.no_grad():
-        outputs = model(**model_input)
-        embeddings = outputs['hidden_states'][-1][:, 1 + clue_tokenization, :]
-    return embeddings
-
-
 def create_embedder(method: str):
     if method == 'GloVe':
         x = load_saved_data(glove_embeddings_file, embedding_saves_dir)
@@ -186,7 +137,11 @@ def get_vocabulary(method: str):
             x = wn.all_synsets('n')
         except LookupError:
             nltk.download('wordnet')
-            x = wn.all_synsets('n')
+            try:
+                x = wn.all_synsets('n')
+            except LookupError:
+                nltk.download('omw-1.4')
+                x = wn.all_synsets('n')
         x = list(map(lambda s: s.name().partition('.')[0], x))
 
     elif method == 'nouns-kaggle':
@@ -259,16 +214,16 @@ def get_embedder_list_vocab(embed_method: str, vocab: list):
     return embeddings, word_indexing_dict, index_word_dict
 
 
-def triple_restricted_vocab(embed_method_1: str, embed_method_2: str, vocab_method: str):
-    """ restrict the vocabulary to all three methods """
-    t0 = time.perf_counter()
-    *_, v1 = get_embedder_with_vocab(embed_method_1, vocab_method)
-    if embed_method_1 == embed_method_2:
-        return v1
-    *_, v2 = get_embedder_with_vocab(embed_method_2, vocab_method)
-    result = list(set(v1).intersection(set(v2)))
-    print("time for triple_restriced_vocab:", time.perf_counter() - t0)
-    return result
+# def triple_restricted_vocab(embed_method_1: str, embed_method_2: str, vocab_method: str):
+#     """ restrict the vocabulary to all three methods """
+#     t0 = time.perf_counter()
+#     *_, v1 = get_embedder_with_vocab(embed_method_1, vocab_method)
+#     if embed_method_1 == embed_method_2:
+#         return v1
+#     *_, v2 = get_embedder_with_vocab(embed_method_2, vocab_method)
+#     result = list(set(v1).intersection(set(v2)))
+#     print("time for triple_restriced_vocab:", time.perf_counter() - t0)
+#     return result
 
 
 def BiSANLM_score(model, tokenizer, sentence: str):
@@ -344,136 +299,6 @@ def few_shot_huggingface(prompt: str, delimiter: str = "###"):
         return response.json()[0]['generated_text'][len(prompt):]
 
 
-def learn_translation_matrix(f_embedding: torch.Tensor, t_embedding: torch.Tensor, lr=0.001, epochs=15, plot=False):
-    # learn translation matrix by gradient descent
-    n, d1 = f_embedding.shape
-    _, d2 = t_embedding.shape
-
-    # translation_mat = nn.Linear(d1, d2, bias=False)
-    translation_mat = nn.Sequential(
-        nn.Linear(d1, 300, bias=False),
-        nn.ReLU(),
-        nn.Linear(300, 300),
-        nn.ReLU(),
-        nn.Linear(300, 300),
-        nn.ReLU(),
-        nn.Linear(300, 300),
-        nn.ReLU(),
-        nn.Linear(300, d2)
-    )
-    optimizer = torch.optim.SGD(translation_mat.parameters(), lr=lr)
-    batch_size = 40
-    losses = defaultdict(list)
-    for epoch in range(epochs):
-        if epoch == epochs // 2:
-            batch_size = 100
-        print(f"epoch {epoch} / {epochs}")
-        optimizer.zero_grad()
-        for i in range(n // batch_size):
-            from_vectors = f_embedding[batch_size*i: batch_size*(i+1)].clone()
-            to_vectors = t_embedding[batch_size*i: batch_size*(i+1)].clone()
-            output = translation_mat(from_vectors)
-            loss = torch.norm(output - to_vectors)
-            loss /= from_vectors.shape[0]
-            loss.backward()
-            losses[f"epoch_{epoch}"].append(loss.item())
-            optimizer.step()
-    if plot:
-        iteration = 0
-        for epoch, loss_vals in losses.items():
-            plt.scatter(range(iteration, iteration + len(loss_vals)), loss_vals, label=epoch)
-            iteration += len(loss_vals)
-        plt.title("loss plot")
-        plt.xlabel("iteration")
-        plt.ylabel("loss")
-        # plt.legend()
-        plt.show()
-    return translation_mat
-
-
-class EmbeddingAgent(nn.Module):
-    """
-    base class for non-contextualized embedding agents.
-    Handels the creation of the embedding matrix, intersection of vocabularies if given vocab is str, and defines
-    the `embedder` function to turn str (or List[str]) to word embedding(s).
-    """
-    def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe',
-                 vocab: list = None, dist_metric: str = 'cosine_sim', translate_to: str = None):
-        super(EmbeddingAgent, self).__init__()
-        self.gca = good_cards_amount
-        self.tca = total_cards_amount
-        self.embeddings, self.word_index_dict, self.index_word_dict = get_embedder_list_vocab(embedding_method, vocab)
-        self.vocab = vocab
-        self.embedding_method = embedding_method
-        assert dist_metric in ['cosine_sim', 'l2']
-        if dist_metric == 'cosine_sim':
-            # Normalize the embedding vectors. Euclidean norm is now rank-equivalent to cosine similarity, so no
-            # further change is needed.
-            embedding_norms = torch.norm(self.embeddings, dim=-1, keepdim=True)
-            self.embeddings = self.embeddings / embedding_norms
-        if translate_to is not None:
-            self.translate_embedding(translate_to)
-
-    def embedder(self, word: List[str] or str):
-        if isinstance(word, str):
-            return self.embeddings[self.word_index_dict.get(word, -1)]
-        elif isinstance(word, list):
-            indices = [self.word_index_dict.get(w, -1) for w in word]
-            return self.embeddings[indices]
-        else:
-            raise ValueError
-
-    def known_word(self, word: str):
-        return word in self.vocab
-
-    def translate_embedding(self, other_embedding):
-        # If other_embedding is a tesor, it must use the same vocabulary in the same order as self.
-        if isinstance(other_embedding, str):
-            if other_embedding == self.embedding_method:
-                return
-            other_array, *_ = get_embedder_list_vocab(other_embedding, self.vocab)
-        elif isinstance(other_embedding, torch.Tensor):
-            other_array = other_embedding.clone().detach()
-        else:
-            raise ValueError(f"illegal type {type(other_embedding)}, should be str or Tensor")
-        # # option 1 - closed LS solution
-        # T = torch.linalg.lstsq(self.embeddings, other_array)[0]
-        # self.embeddings = self.embeddings @ T
-        ###
-        # option 2 - learnable MLP
-        T = learn_translation_matrix(self.embeddings, other_array, plot=True)
-        self.embeddings = T(self.embeddings)
-        ###
-        print(f"manually calculated final loss value: {torch.norm(self.embeddings - other_array)}")
-        # print(f"translating {self.embedding_method} to {other_embedding}. T shape is {T.shape}")
-
-
-class ContextEmbeddingAgent(nn.Module):
-    """
-    Currently the vocab_method input to this class is unused, and the vocabulary is BERT's tokens.
-    """
-    def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'bert',
-                 vocab: list = None, dist_metric: str = 'l2'):
-        super(ContextEmbeddingAgent, self).__init__()
-        self.gca = good_cards_amount
-        self.tca = total_cards_amount
-        self.model, self.tokenizer = initiate_bert(embedding_method)
-        self.normalize_embeds = dist_metric == 'cosine_sim'
-
-    def embedder(self, word: List[str] or str, context: str):
-        if isinstance(word, str):
-            word = [word]
-        result = bert_multiple_context_emb(self.model, self.tokenizer, word, context)
-        if self.normalize_embeds:
-            embedding_norms = torch.norm(result, dim=-1, keepdim=True)
-            result = result / embedding_norms
-        return result
-
-    @staticmethod
-    def known_word(word: str):
-        return True
-
-
 def average_rank_embedding_distance(agent1: EmbeddingAgent, agent2: EmbeddingAgent, vocab: list = None):
     if vocab is None:
         assert agent1.vocab == agent2.vocab, "can only compare embeddings with the same vocabulary unless given one"
@@ -490,9 +315,30 @@ def average_rank_embedding_distance(agent1: EmbeddingAgent, agent2: EmbeddingAge
         word_array = embedding2[i]
         norm_diff = torch.norm(embedding2 - word_array, dim=1)
         sorted_indices_2 = norm_diff.argsort()
-        diff += (sorted_indices_1 - sorted_indices_2).abs().sum() / N
-    diff = diff / N
+        new_diff = (sorted_indices_1 - sorted_indices_2).abs().sum() / len(vocab)
+        diff += new_diff.item()
+    diff /= N
     return diff
+
+
+def noise_experiment_plots():
+    df = pd.read_csv(os.path.join(ROTEM_RESULTS_DIR, 'noise_experiment_final'))
+    noises = df['noise']
+    for y in ['norm_difference', 'metric_difference', 'game_difference']:
+        y_name = y.replace('_', ' ')
+        plt.plot(noises, df[y])
+        plt.title(f"{y_name} as a function of noise")
+        plt.xlabel("noise")
+        plt.ylabel(y_name)
+        plt.show()
+
+    for y in ['norm_difference', 'metric_difference', 'game_difference']:
+        y_name = y.replace('_', ' ')
+        plt.semilogx(noises, df[y])
+        plt.title(f"{y_name} as a function of noise, log-x")
+        plt.xlabel("noise")
+        plt.ylabel(y_name)
+        plt.show()
 
 
 #########################
