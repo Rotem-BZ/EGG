@@ -4,11 +4,14 @@ from torch.nn import functional as F
 from transformers import BertTokenizer, BertForMaskedLM, DebertaTokenizer, DebertaForMaskedLM
 from transformers import GPTNeoForCausalLM, GPT2Tokenizer
 from scipy.cluster.vq import kmeans2
+import numpy as np
+import faiss
 
 from typing import List
 from collections import defaultdict
 import random
 from os.path import isfile
+from abc import ABC
 
 import rotem_utils
 
@@ -18,7 +21,55 @@ pretrained_fewshot: tuple = ()
 GPT_NEO_NAME = "EleutherAI/gpt-neo-2.7B" if isfile('remote_machine_file') else "EleutherAI/gpt-neo-125M"
 
 
-class EmbeddingAgent(nn.Module):
+class Agent(nn.Module, ABC):
+    def __init__(self, total_cards_amount: int, good_cards_amount: int):
+        super(Agent, self).__init__()
+        self.gca = good_cards_amount
+        self.tca = total_cards_amount
+        self.known_red_cards = []
+        self.known_blue_cards = []
+
+    def update_knowledge(self, word: str, color: str):
+        if color == 'blue':
+            self.known_blue_cards.append(word)
+        elif color == 'red':
+            self.known_red_cards.append(word)
+        else:
+            raise ValueError(f"illegal color {color}")
+
+    def reset_knowledge(self):
+        self.known_red_cards = []
+        self.known_blue_cards = []
+
+    def sender_knowledge_forward(self, words):
+        good_words, bad_words = words
+        good_words = [x for x in good_words if x not in self.known_blue_cards]
+        bad_words = [x for x in bad_words if x not in self.known_red_cards]
+        return_tuple = None
+        if len(good_words) == 0:
+            # shouldn't happen
+            print("WARNING good words list is empty!")
+        if len(bad_words) == 0:
+            # the receiver discovered all red words so no further hinting is required. choose arbitrary clue
+            # for the rest of the blue words
+            clue_word = None
+            for word in self.vocab:
+                if word not in good_words + self.known_red_cards:
+                    clue_word = word
+                    break
+            return_tuple = (clue_word, len(good_words), good_words, {'optimal_amount': len(good_words)})
+        return good_words, bad_words, return_tuple
+
+    def receiver_knowledge_forward(self, words, clue):
+        clue_word, clue_amount = clue
+        board_blue_cards = [word for word in words if word in self.known_blue_cards]
+        if board_blue_cards:
+            clue_amount -= len(board_blue_cards)
+        words = [x for x in words if x not in self.known_red_cards + self.known_blue_cards]
+        return words, clue_word, clue_amount, board_blue_cards
+
+
+class EmbeddingAgent(Agent):
     """
     base class for non-contextualized embedding agents.
     Handels the creation of the embedding matrix, intersection of vocabularies if given vocab is str, and defines
@@ -27,13 +78,12 @@ class EmbeddingAgent(nn.Module):
 
     def __init__(self, total_cards_amount: int, good_cards_amount: int, embedding_method: str = 'GloVe',
                  vocab: list = None, dist_metric: str = 'cosine_sim', translate_to: str = None):
-        super(EmbeddingAgent, self).__init__()
-        self.gca = good_cards_amount
-        self.tca = total_cards_amount
+        super(EmbeddingAgent, self).__init__(total_cards_amount, good_cards_amount)
         self.embeddings, self.word_index_dict, self.index_word_dict = rotem_utils.get_embedder_list_vocab(
             embedding_method, vocab)
         self.vocab = vocab
         self.embedding_method = embedding_method
+        self.known_red_cards = []   # the red cards that the receiver already knows. also used by sender.
         assert dist_metric in ['cosine_sim', 'l2']
         if dist_metric == 'cosine_sim':
             # Normalize the embedding vectors. Euclidean norm is now rank-equivalent to cosine similarity, so no
@@ -113,7 +163,7 @@ class EmbeddingAgent(nn.Module):
         return translation_mat
 
 
-class ContextEmbeddingAgent(nn.Module):
+class ContextEmbeddingAgent(Agent):
     """
     Currently the vocab_method input to this class is unused, and the vocabulary is BERT's tokens.
     """
@@ -125,6 +175,7 @@ class ContextEmbeddingAgent(nn.Module):
         self.tca = total_cards_amount
         self.model, self.tokenizer = self.initiate_LM(embedding_method)
         self.normalize_embeds = dist_metric == 'cosine_sim'
+        self.known_red_cards = []   # the red cards that the receiver already knows. also used by sender.
 
     def embedder(self, word: List[str] or str, context: str):
         if isinstance(word, str):
@@ -255,13 +306,11 @@ class EmbeddingClusterSender(EmbeddingAgent):
             (('one', 'two', 'three', 'four'), 'numbers'),
             (targets, '')
         ]])
-        print("prompt")
-        print(prompt)
-        print('\n')
+
+        # print("prompt")
+        # print(prompt)
         # print('\n')
-        # for sentence in prompt.split(delimiter):
-        #     print(sentence)
-        # print('\n')
+
         if self.reduction_method == 'centroid':
             norm_dif = torch.norm(self.embeddings[:-1] - centroid, dim=1)
             norm_dif[[self.word_index_dict[word] for word in words]] = torch.inf
@@ -341,8 +390,8 @@ class EmbeddingClusterSender(EmbeddingAgent):
         largest_cluster_size = 0
         largest_cluster_indices = None
         largest_cluster_centroid = None
+        data = torch.cat([self.good_embeds, self.bad_embeds], dim=0)
         for cluster_amount in self.cluster_amounts:
-            data = torch.cat([self.good_embeds, self.bad_embeds], dim=0)
             centroids, labels = kmeans2(data, cluster_amount)
             labels = torch.from_numpy(labels)
             good_cluster_labels = set(labels[:self.gca].tolist()) - set(labels[self.gca:].tolist())
@@ -360,7 +409,10 @@ class EmbeddingClusterSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words = words
+        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        if return_tuple is not None:
+            return return_tuple
+
         self.good_embeds = self.embedder(good_words)
         self.bad_embeds = self.embedder(bad_words)
 
@@ -371,7 +423,9 @@ class EmbeddingClusterSender(EmbeddingAgent):
         return clue_word, clue_len, sorted(targets), {}
 
     def ranked_forward(self, words: tuple, verbose: bool = False):
-        good_words, bad_words = words
+        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        if return_tuple is not None:
+            return return_tuple
         self.good_embeds = self.embedder(good_words)
         self.bad_embeds = self.embedder(bad_words)
 
@@ -417,12 +471,18 @@ class ExhaustiveSearchSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words = words
+        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        if return_tuple is not None:
+            return return_tuple
+
         good_embeds = self.embedder(good_words)
         bad_embeds = self.embedder(bad_words)
 
-        good_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
-        bad_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
+        # good_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
+        # bad_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
+
+        good_diff = torch.norm(self.embeddings.unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
+        bad_diff = torch.norm(self.embeddings.unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
 
         closest_bad_distance = bad_diff.min(dim=1, keepdim=True)[0]  # distance to the closest bad card - shape (N, 1)
         boolean_closeness_mat = (good_diff < closest_bad_distance)
@@ -449,16 +509,22 @@ class ExhaustiveSearchSender(EmbeddingAgent):
         targets = sorted([good_words[i] for i in cluster_words_indices])
         return clue_word, best_word_cluesize.item(), targets, {'optimal_amount': len(all_best_indices)}
 
+
     def ranked_forward(self, words: tuple, verbose: bool = False):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words = words
+        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        if return_tuple is not None:
+            return return_tuple
         good_embeds = self.embedder(good_words)
         bad_embeds = self.embedder(bad_words)
 
-        good_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
-        bad_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
+        # good_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
+        # bad_diff = torch.norm(self.embeddings[:-1].unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
+
+        good_diff = torch.norm(self.embeddings.unsqueeze(1) - good_embeds, dim=-1)  # (N_vocab, num_good_cards)
+        bad_diff = torch.norm(self.embeddings.unsqueeze(1) - bad_embeds, dim=-1)  # (N_vocab, num_bad_cards)
 
         closest_bad_distance = bad_diff.min(dim=1, keepdim=True)[0]  # distance to the closest bad card - shape (N, 1)
         boolean_closeness_mat = (good_diff < closest_bad_distance)
@@ -498,7 +564,9 @@ class CompletelyRandomSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words = words
+        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        if return_tuple is not None:
+            return return_tuple
         sample = random.sample(self.vocab, len(good_words) + len(bad_words) + 1)
         clue_word = None
         for word in sample:
@@ -527,24 +595,37 @@ class EmbeddingNearestReceiver(EmbeddingAgent):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        clue_word, clue_amount = clue
+        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
         clue_array = self.embedder(clue_word)
         words_array = self.embedder(words)
         norm_dif = torch.norm(words_array - clue_array, dim=1)
         _, indices = torch.topk(norm_dif, clue_amount, largest=False)
-        return [words[i] for i in indices]
+        return board_blue_cards + [words[i] for i in indices]
+
+    def faiss_forward(self, words: List[str], clues: List[tuple]):
+        # quick batch processing of clues using faiss library. board is constant.
+        # knowledge usuage is not supported
+        clue_words, clue_sizes = zip(*clues)
+        max_cluesize = max(clue_sizes)
+        clues_array = self.embedder(list(clue_words))
+        words_array = self.embedder(words)
+        index = faiss.IndexFlatL2(self.embeddings.shape[1])
+        index.add(words_array.numpy())
+        _, I = index.search(clues_array.numpy(), max_cluesize)
+        ids = [a[:s].tolist() for a, s in zip(I, clue_sizes)]
+        return [[words[i] for i in indices] for indices in ids]
 
     def ranked_forward(self, words: List[str], clue: tuple):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        clue_word, clue_amount = clue
+        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
         clue_array = self.embedder(clue_word)
         words_array = self.embedder(words)
         norm_diff = torch.norm(words_array - clue_array, dim=1)
         sorted_indices = norm_diff.argsort()
         sorted_vocabulary = [words[i] for i in sorted_indices]
-        return sorted_vocabulary
+        return board_blue_cards + sorted_vocabulary
 
 
 class CompletelyRandomReceiver(EmbeddingAgent):
@@ -555,16 +636,17 @@ class CompletelyRandomReceiver(EmbeddingAgent):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        clue_word, clue_amount = clue
+        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
         choice = random.sample(words, clue_amount)
-        return choice
+        return board_blue_cards + choice
 
     def ranked_forward(self, words: List[str], clue: tuple):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
+        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
         shuffle = random.sample(words, len(words))
-        return shuffle
+        return board_blue_cards + shuffle
 
 
 class ContextualizedReceiver(ContextEmbeddingAgent):
@@ -572,10 +654,10 @@ class ContextualizedReceiver(ContextEmbeddingAgent):
         super(ContextualizedReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab, dist_metric)
 
     def forward(self, words: List[str], clue: tuple):
-        clue_word, clue_amount = clue
+        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
         clue_array = self.embedder(clue_word, context=clue_word).view(-1)  # (768)
         assert len(clue_array.shape) == 1
         words_array = self.embedder(words, context=clue_word)  # (N_words, 768)
         norm_dif = torch.norm(words_array - clue_array, dim=1)  # (N_word)
         _, indices = torch.topk(norm_dif, clue_amount, largest=False)
-        return [words[i] for i in indices]
+        return board_blue_cards + [words[i] for i in indices]

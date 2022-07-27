@@ -15,7 +15,6 @@ from dataclasses import dataclass
 import pandas as pd
 import math
 
-
 class CodenameDataLoader:
     def __init__(self, total_cards_amount: int, good_cards_amount: int, agent_vocab: list,
                  board_vocab: str = 'wordnet-nouns'):
@@ -414,6 +413,8 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
     -------
     list of clues, list of guesses, list of targets guessesd and the amount of iterations (which is the length of the other lists)
     """
+    sender: EmbeddingAgent
+    receiver: EmbeddingAgent
     opts = CodenamesOptions(**opts_kwargs, tca=len(good_words) + len(bad_words), gca=len(good_words))
     if max_iter is None:
         max_iter = len(good_words) + 1
@@ -430,6 +431,9 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
             if guess in reference:
                 relevant_choice.append(guess)
             else:
+                color = 'blue' if guess in good_words else 'red'
+                opts.sender.update_knowledge(guess, color)
+                opts.receiver.update_knowledge(guess, color)
                 break
         good_words = [word for word in good_words if word not in relevant_choice]
 
@@ -460,6 +464,8 @@ def multiple_game_metric(N: int, accept_unintended_blue: bool = False,
     metric_sum = 0
     for _ in range(N):
         (good_words, bad_words), _ = next(dataloader)
+        sender.reset_knowledge()
+        receiver.reset_knowledge()
         *_, metric = game_metric(good_words, bad_words, accept_unintended_blue, max_iter,
                                  deterministic_agents=deterministic_agents,
                                  sender_instance=sender, receiver_instance=receiver, **new_opts_kwargs)
@@ -530,7 +536,7 @@ def noise_experiment(**opts_kwargs):
 
         embedding_mat_dists.append(torch.norm(W_sender.embeddings - word2vec_embedding_mat).item())
         embedding_metric_dists.append(rotem_utils.average_rank_embedding_distance(W_sender, receiver, vocab=vocab))
-        game_metric_dists.append(multiple_game_metric(N=5, accept_unintended_blue=False, deterministic_agents=True,
+        game_metric_dists.append(multiple_game_metric(N=5, accept_unintended_blue=False, deterministic_agents=False,
                                                       sender_emb_method="word2vec", receiver_emb_method="word2vec",
                                                       agent_vocab='word2vec', sender_instance=W_sender,
                                                       receiver_instance=receiver, **opts_kwargs))
@@ -539,7 +545,7 @@ def noise_experiment(**opts_kwargs):
     print(df)
     if not os.path.isdir(rotem_utils.ROTEM_RESULTS_DIR):
         os.mkdir(rotem_utils.ROTEM_RESULTS_DIR)
-    df.to_csv(os.path.join(rotem_utils.ROTEM_RESULTS_DIR, 'noise_experiment_final'))
+    df.to_csv(os.path.join(rotem_utils.ROTEM_RESULTS_DIR, 'noise_experiment_26_07'))
 
 
 if __name__ == '__main__':
@@ -562,16 +568,37 @@ if __name__ == '__main__':
     # model, tokenizer = rotem_utils.initiate_bert()
     # rotem_utils.bert_multiple_context_emb(model, tokenizer, word_list=['dog', 'cat'], context='well')
 
-    opts = CodenamesOptions(sender_type='cluster', reduction_method='few-shot-greedy',
+    # opts = CodenamesOptions(sender_type='cluster', reduction_method='few-shot-greedy',
+    #                         sender_emb_method='word2vec', agent_vocab='codenames-words',
+    #                         receiver_emb_method='word2vec', dist_metric='cosine_sim',
+    #                         tca=6, gca=3)
+    # with open('few-shot_clues_gen.txt', 'w') as writefile:
+    #     for _ in range(30):
+    #         sender_input, _ = next(opts.dataloader)
+    #         clue_word, clue_size, targets, extra_data = opts.sender(sender_input, verbose=False)
+    #         # print('good words:', good_words)
+    #         # print('bad words:', bad_words)
+    #         print(f"\t clue: \t {clue_word} \n \t for: \t {targets} \n")
+    #         writefile.write(f"\t clue: \t {clue_word} \n \t for: \t {targets} \n \n")
+
+    opts = CodenamesOptions(receiver_type='embedding',
                             sender_emb_method='word2vec', agent_vocab='codenames-words',
                             receiver_emb_method='word2vec', dist_metric='cosine_sim',
-                            tca=6, gca=3)
-    for _ in range(10):
-        sender_input, _ = next(opts.dataloader)
-        clue_word, clue_size, targets, extra_data = opts.sender(sender_input, verbose=False)
-        # print('good words:', good_words)
-        # print('bad words:', bad_words)
-        print(f"\t clue: \t {clue_word} \n \t for: \t {targets} \n")
+                            tca=20, gca=6)
+    sender, receiver, dataloader = opts.game_instance()
+    clues = []
+    for _ in tqdm(list(range(30000))):
+        sender_input, _ = next(dataloader)
+        clue_word, clue_size, targets, extra_data = sender(sender_input, verbose=False)
+        clues.append((clue_word, clue_size))
+    _, receiver_input = next(dataloader)
+    t0 = time.perf_counter()
+    choices1 = receiver.faiss_forward(receiver_input, clues)
+    t1 = time.perf_counter()
+    choices2 = [receiver(receiver_input, clue) for clue in clues]
+    t2 = time.perf_counter()
+    print(f"{choices1[0]=}, {choices2[0]=}")
+    print(f"time with faiss: {t1 - t0}, time with list comp: {t2 - t1}")
 
     # synthetic_receiver_round(good_words=['cat', 'dog', 'mouse'],
     #                          bad_words=['electricity', 'stick', 'child'],

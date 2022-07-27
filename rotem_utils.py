@@ -322,7 +322,7 @@ def average_rank_embedding_distance(agent1: EmbeddingAgent, agent2: EmbeddingAge
 
 
 def noise_experiment_plots():
-    df = pd.read_csv(os.path.join(ROTEM_RESULTS_DIR, 'noise_experiment_final'))
+    df = pd.read_csv(os.path.join(ROTEM_RESULTS_DIR, 'noise_experiment_26_07'))
     noises = df['noise']
     for y in ['norm_difference', 'metric_difference', 'game_difference']:
         y_name = y.replace('_', ' ')
