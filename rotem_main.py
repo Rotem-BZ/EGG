@@ -9,11 +9,13 @@ import evaluation_measures as EvalMeasures
 import random
 import os
 from itertools import product
+from functools import partial
 import time
 from tqdm import tqdm
 from dataclasses import dataclass
 import pandas as pd
 import math
+
 
 class CodenameDataLoader:
     def __init__(self, total_cards_amount: int, good_cards_amount: int, agent_vocab: list,
@@ -69,9 +71,11 @@ class CodenamesOptions:
     reduction_method: str = 'centroid'  # for cluster sender
     sender_emb_method: str = 'GloVe'
     sender_linear_translation: bool = False
+    sender_translate_subvocab: bool = False
     receiver_type: str = 'embedding'
     receiver_emb_method: str = 'GloVe'
     receiver_linear_translation: bool = False
+    receiver_translate_subvocab: bool = False
     agent_vocab: str = 'wordnet-nouns'
     board_vocab: str = 'codenames-words'
     dist_metric: str = 'cosine_sim'
@@ -86,7 +90,8 @@ class CodenamesOptions:
         str_inputs = ['sender_type', 'exhaustive_tiebreak', 'reduction_method', 'sender_emb_method', 'receiver_type',
                       'receiver_emb_method',
                       'agent_vocab', 'board_vocab', 'dist_metric']
-        bool_inputs = ['verbose', 'sender_linear_translation', 'receiver_linear_translation']
+        bool_inputs = ['verbose', 'sender_linear_translation', 'receiver_linear_translation',
+                       'sender_translate_subvocab', 'receiver_translate_subvocab']
         legal_str_options = {'sender_type': ['exhaustive', 'cluster', 'random'],
                              'exhaustive_tiebreak': ['avg_blue_dist', 'max_blue_dist', 'max_radius', 'red_blue_diff'],
                              'reduction_method': ['centroid', 'few-shot-1_token', 'few-shot-greedy', 'few-shot-api',
@@ -128,7 +133,8 @@ class CodenamesOptions:
         if self.sender_linear_translation:
             # receiver_embedding = self.receiver_emb_method if self.receiver_instance is None else self.receiver_instance.embeddings
             receiver_embedding = self.receiver_emb_method
-            self.sender_instance.translate_embedding(receiver_embedding)
+            subvocab = self.board_vocab if self.sender_translate_subvocab else None
+            self.sender_instance.translate_embedding(receiver_embedding, subvocab)
 
     def _make_receiver(self):
         receiver_class = {'embedding': EmbeddingNearestReceiver,
@@ -144,7 +150,8 @@ class CodenamesOptions:
         if self.receiver_linear_translation:
             # sender_embedding = self.sender_emb_method if self.sender_instance is None else self.sender_instance.embeddings
             sender_embedding = self.sender_emb_method
-            self.receiver_instance.translate_embedding(sender_embedding)
+            subvocab = self.board_vocab if self.receiver_translate_subvocab else None
+            self.receiver_instance.translate_embedding(sender_embedding, subvocab)
 
     def _make_dataloader(self):
         dataloader = CodenameDataLoader(self.tca, self.gca, self.intersected_agent_vocab, self.board_vocab)
@@ -391,7 +398,7 @@ def synthetic_receiver_round(good_words: list, bad_words: list, targets: list, c
 
 
 def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool = False,
-                max_iter: int = None, deterministic_agents: bool = False, **opts_kwargs):
+                max_iter: int = None, deterministic_agents: bool = False, pass_knowledge: bool = True, **opts_kwargs):
     """
     operates a single game until the receiver guesses all the good words or max_iter is reached.
     Parameters
@@ -408,6 +415,8 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
         bound on iterations (amount of clues) - defaults to len(good_words) + 1
     deterministic_agents
         if the agents are deterministic, there is no need to continue calculating if no progress is made in any single round.
+    pass_knowledge
+        whether to update agents' knowledge upon a wrong guess
 
     Returns
     -------
@@ -415,6 +424,7 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
     """
     sender: EmbeddingAgent
     receiver: EmbeddingAgent
+    bad_words = [x for x in bad_words]  # copy to avoid changing the input inplace
     opts = CodenamesOptions(**opts_kwargs, tca=len(good_words) + len(bad_words), gca=len(good_words))
     if max_iter is None:
         max_iter = len(good_words) + 1
@@ -431,9 +441,13 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
             if guess in reference:
                 relevant_choice.append(guess)
             else:
-                color = 'blue' if guess in good_words else 'red'
-                opts.sender.update_knowledge(guess, color)
-                opts.receiver.update_knowledge(guess, color)
+                # update revealed card knowledge and break. unintended blue at the last guess is equivalent to guessing
+                # a target.
+                if pass_knowledge:
+                    if guess in good_words:
+                        relevant_choice.append(guess)
+                    else:
+                        del bad_words[bad_words.index(guess)]
                 break
         good_words = [word for word in good_words if word not in relevant_choice]
 
@@ -451,7 +465,8 @@ def game_metric(good_words: list, bad_words: list, accept_unintended_blue: bool 
 
 
 def multiple_game_metric(N: int, accept_unintended_blue: bool = False,
-                         max_iter: int = None, deterministic_agents: bool = False, **opts_kwargs):
+                         max_iter: int = None, deterministic_agents: bool = False, pass_knowledge: bool = True,
+                         **opts_kwargs):
     """
     averages the game metric over multiple runs.
     """
@@ -467,20 +482,91 @@ def multiple_game_metric(N: int, accept_unintended_blue: bool = False,
         sender.reset_knowledge()
         receiver.reset_knowledge()
         *_, metric = game_metric(good_words, bad_words, accept_unintended_blue, max_iter,
-                                 deterministic_agents=deterministic_agents,
+                                 deterministic_agents=deterministic_agents, pass_knowledge=pass_knowledge,
                                  sender_instance=sender, receiver_instance=receiver, **new_opts_kwargs)
         metric_sum += metric
 
     return metric_sum / N
 
 
-def test_glove_w2v(**opts_kwargs):
+def senders_comparison_experiment(one_exhaustive: bool = True, **opts_kwargs):
+    """
+
+    Parameters
+    ----------
+    opts_kwargs
+        should include tca, gca, vocabularies and embeddings of the agents.
+        MUST NOT INCLUDE sender_type, reduction_method, exhaustive_tiebreak
+    one_exhaustive
+        use only one type of exhaustive for sync experiment
+
+    Returns
+    -------
+    prints comparison with game_metric and returns the dataframe
+    """
+    game_metric_scores = []
+    skyline_metric_scores = []
+    sender_types = ['random', 'exhaustive'] if one_exhaustive else ['random']
+    opts_random = CodenamesOptions(**opts_kwargs, sender_type='random')
+    random_sender, receiver, dataloader = opts_random.game_instance()
+    metric_function = lambda sender_instance: multiple_game_metric(N=20, accept_unintended_blue=False,
+                                                                   deterministic_agents=False,
+                                                                   sender_instance=sender_instance,
+                                                                   receiver_instance=receiver,
+                                                                   dataloader_instance=dataloader,
+                                                                   **opts_kwargs
+                                                                   )
+
+    def skyline_metric_function(sender_instance):
+        *_, accuracies = skyline_main(trial_amount=20, **opts_kwargs, sender_instance=sender_instance,
+                                      receiver_instance=receiver, dataloader_instance=dataloader)
+        return sum(accuracies) / len(accuracies)
+
+    game_metric_scores.append(metric_function(random_sender))
+    print("calculated random score")
+    skyline_metric_scores.append(skyline_metric_function(random_sender))
+    print("calcualted random skyline")
+    if one_exhaustive:
+        exhaustive_sender = CodenamesOptions(**opts_kwargs, sender_type='exhaustive').sender
+        game_metric_scores.append(metric_function(exhaustive_sender))
+        print("calculated exhaustive score")
+        skyline_metric_scores.append(skyline_metric_function(exhaustive_sender))
+        print("calcualted exhaustive skyline")
+    else:
+        for tiebreak_method in ['avg_blue_dist', 'max_blue_dist', 'max_radius', 'red_blue_diff']:
+            name = 'exhaustive_tiebreak-' + tiebreak_method
+            sender_types.append(name)
+            exhaustive_sender = CodenamesOptions(**opts_kwargs, sender_type='exhaustive',
+                                                 exhaustive_tiebreak=tiebreak_method).sender
+            game_metric_scores.append(metric_function(exhaustive_sender))
+            print(f"calculated {name} score")
+            skyline_metric_scores.append(skyline_metric_function(exhaustive_sender))
+            print(f"calcualted {name} skyline")
+    for reduction_method in ['centroid', 'few-shot-api', 'few-shot-1_token', 'few-shot-greedy', 'fusion']:
+        name = 'cluster_reduction-' + reduction_method
+        sender_types.append(name)
+        cluster_sender = CodenamesOptions(**opts_kwargs, sender_type='cluster', reduction_method=reduction_method).sender
+        game_metric_scores.append(metric_function(cluster_sender))
+        print(f"calculated {name} score")
+        skyline_metric_scores.append(skyline_metric_function(cluster_sender))
+        print(f"calcualted {name} skyline")
+
+    comparison_df = pd.DataFrame({'model': sender_types, 'game_metric': game_metric_scores,
+                                  'avg.metric': skyline_metric_scores})
+    print(comparison_df)
+    if not os.path.isdir(rotem_utils.ROTEM_RESULTS_DIR):
+        os.mkdir(rotem_utils.ROTEM_RESULTS_DIR)
+    comparison_df.to_csv(os.path.join(rotem_utils.ROTEM_RESULTS_DIR, 'sender_comparison_unsync_03_08_22'))
+
+
+def translation_experiment(**opts_kwargs):
     avg_metrics = dict()
     combinations = list(product(['word2vec', 'word2vec_T', 'GloVe_T'], ['GloVe', 'GloVe_T', 'word2vec_T']))
     opts_w_g_t = CodenamesOptions(**opts_kwargs,
                                   sender_emb_method="word2vec",
                                   receiver_emb_method="GloVe",
-                                  sender_linear_translation=True, receiver_linear_translation=True)
+                                  sender_linear_translation=True, receiver_linear_translation=True,
+                                  sender_translate_subvocab=True, receiver_translate_subvocab=True)
     W_sender_t = opts_w_g_t.sender
     G_receiver_t = opts_w_g_t.receiver
     opts_w_g = CodenamesOptions(**opts_kwargs,
@@ -491,7 +577,8 @@ def test_glove_w2v(**opts_kwargs):
     opts_g_w_t = CodenamesOptions(**opts_kwargs,
                                   sender_emb_method="GloVe",
                                   receiver_emb_method="word2vec",
-                                  sender_linear_translation=True, receiver_linear_translation=True)
+                                  sender_linear_translation=True, receiver_linear_translation=True,
+                                  sender_translate_subvocab=True, receiver_translate_subvocab=True)
     G_sender_t = opts_g_w_t.sender
     W_receiver_t = opts_g_w_t.receiver
     dataloader = iter(opts_w_g_t.dataloader)
@@ -500,15 +587,18 @@ def test_glove_w2v(**opts_kwargs):
         print(f"calculating score for {sender_embedding} sender and {receiver_embedding} receiver")
         sender = {'word2vec': W_sender, 'word2vec_T': W_sender_t, 'GloVe_T': G_sender_t}[sender_embedding]
         receiver = {'GloVe': G_receiver, 'GloVe_T': G_receiver_t, 'word2vec_T': W_receiver_t}[receiver_embedding]
-        metric_array = []
-        for _ in tqdm(range(20)):
-            (good_words, bad_words), _ = next(dataloader)
-            *_, metric = game_metric(good_words=good_words, bad_words=bad_words,
-                                     sender_instance=sender, receiver_instance=receiver)
-            metric_array.append(metric)
-        avg_metrics[(sender_embedding, receiver_embedding)] = sum(metric_array) / len(metric_array)
+        avg_metrics[(sender_embedding, receiver_embedding)] = multiple_game_metric(N=20, accept_unintended_blue=False,
+                                                                                   deterministic_agents=False,
+                                                                                   sender_emb_method="word2vec",
+                                                                                   receiver_emb_method="GloVe",
+                                                                                   agent_vocab='word2vec',
+                                                                                   sender_instance=sender,
+                                                                                   receiver_instance=receiver,
+                                                                                   dataloader_instance=dataloader,
+                                                                                   **opts_kwargs
+                                                                                   )
         print(
-            f"for {sender_embedding} sender and {receiver_embedding} receiver: score {sum(metric_array) / len(metric_array)}")
+            f"for {sender_embedding} sender and {receiver_embedding} receiver: score {avg_metrics[(sender_embedding, receiver_embedding)]}")
     sender_embeds, receiver_embeds = zip(*combinations)
     metric_score = [avg_metrics[k] for k in combinations]
     df = pd.DataFrame({"Sender": sender_embeds, "Receiver": receiver_embeds, "metric(low=good)": metric_score})
@@ -548,6 +638,29 @@ def noise_experiment(**opts_kwargs):
     df.to_csv(os.path.join(rotem_utils.ROTEM_RESULTS_DIR, 'noise_experiment_26_07'))
 
 
+def game_metric_experiment(**opts_kwargs):
+    opts = CodenamesOptions(**opts_kwargs)
+    sender, receiver, dataloader = opts.game_instance()
+    scores = []
+    accept_blue_list = []
+    gain_knowledge_list = []
+    for unintended_blue, knowledge in tqdm(list(product([True, False], [True, False]))):
+        score = multiple_game_metric(N=30, accept_unintended_blue=unintended_blue, pass_knowledge=knowledge,
+                                     deterministic_agents=False,
+                                     sender_instance=sender, receiver_instance=receiver, dataloader_instance=dataloader,
+                                     **opts_kwargs)
+        accept_blue_list.append(unintended_blue)
+        gain_knowledge_list.append(knowledge)
+        scores.append(score)
+    df = pd.DataFrame({'accept_unintended_blue': accept_blue_list, 'pass_knowledge': gain_knowledge_list,
+                       'game_metric': scores})
+    print(df)
+    if not os.path.isdir(rotem_utils.ROTEM_RESULTS_DIR):
+        os.mkdir(rotem_utils.ROTEM_RESULTS_DIR)
+    df.to_csv(os.path.join(rotem_utils.ROTEM_RESULTS_DIR, 'game_metric_experiment'))
+
+
+
 if __name__ == '__main__':
     # clue_words, clue_sizes, sender_times, receiver_times, accuracies = skyline_main(trial_amount=50, verbose=True,
     #                                                                                 tca=6, gca=3,
@@ -560,18 +673,28 @@ if __name__ == '__main__':
     #                                                                                 dist_metric='cosine_sim'
     #                                                                                 )
 
+    # translation_experiment(tca=20, gca=10)
+
     # noise_experiment(tca=20, gca=10)
     # rotem_utils.noise_experiment_plots()
 
     # interactive_game()
 
+    senders_comparison_experiment(tca=20, gca=10, sender_emb_method='GloVe', receiver_emb_method='word2vec',
+                                  one_exhaustive=False)
+
+    # game_metric_experiment(tca=30, gca=15, sender_type='exhaustive', receiver_type='embedding',
+    #                        sender_emb_method='GloVe', receiver_emb_method='word2vec')
+
     # model, tokenizer = rotem_utils.initiate_bert()
     # rotem_utils.bert_multiple_context_emb(model, tokenizer, word_list=['dog', 'cat'], context='well')
 
-    # opts = CodenamesOptions(sender_type='cluster', reduction_method='few-shot-greedy',
+    # opts = CodenamesOptions(sender_type='cluster', reduction_method='centroid',
     #                         sender_emb_method='word2vec', agent_vocab='codenames-words',
     #                         receiver_emb_method='word2vec', dist_metric='cosine_sim',
     #                         tca=6, gca=3)
+    # sender_input, _ = next(opts.dataloader)
+    # clue_word, clue_size, targets, extra_data = opts.sender(sender_input, verbose=False)
     # with open('few-shot_clues_gen.txt', 'w') as writefile:
     #     for _ in range(30):
     #         sender_input, _ = next(opts.dataloader)
@@ -580,25 +703,6 @@ if __name__ == '__main__':
     #         # print('bad words:', bad_words)
     #         print(f"\t clue: \t {clue_word} \n \t for: \t {targets} \n")
     #         writefile.write(f"\t clue: \t {clue_word} \n \t for: \t {targets} \n \n")
-
-    opts = CodenamesOptions(receiver_type='embedding',
-                            sender_emb_method='word2vec', agent_vocab='codenames-words',
-                            receiver_emb_method='word2vec', dist_metric='cosine_sim',
-                            tca=20, gca=6)
-    sender, receiver, dataloader = opts.game_instance()
-    clues = []
-    for _ in tqdm(list(range(30000))):
-        sender_input, _ = next(dataloader)
-        clue_word, clue_size, targets, extra_data = sender(sender_input, verbose=False)
-        clues.append((clue_word, clue_size))
-    _, receiver_input = next(dataloader)
-    t0 = time.perf_counter()
-    choices1 = receiver.faiss_forward(receiver_input, clues)
-    t1 = time.perf_counter()
-    choices2 = [receiver(receiver_input, clue) for clue in clues]
-    t2 = time.perf_counter()
-    print(f"{choices1[0]=}, {choices2[0]=}")
-    print(f"time with faiss: {t1 - t0}, time with list comp: {t2 - t1}")
 
     # synthetic_receiver_round(good_words=['cat', 'dog', 'mouse'],
     #                          bad_words=['electricity', 'stick', 'child'],

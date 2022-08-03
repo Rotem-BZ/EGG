@@ -54,7 +54,7 @@ class Agent(nn.Module, ABC):
             # for the rest of the blue words
             clue_word = None
             for word in self.vocab:
-                if word not in good_words + self.known_red_cards:
+                if word not in good_words + bad_words + self.known_blue_cards + self.known_red_cards:
                     clue_word = word
                     break
             return_tuple = (clue_word, len(good_words), good_words, {'optimal_amount': len(good_words)})
@@ -83,7 +83,7 @@ class EmbeddingAgent(Agent):
             embedding_method, vocab)
         self.vocab = vocab
         self.embedding_method = embedding_method
-        self.known_red_cards = []   # the red cards that the receiver already knows. also used by sender.
+        self.dist_metric = dist_metric
         assert dist_metric in ['cosine_sim', 'l2']
         if dist_metric == 'cosine_sim':
             # Normalize the embedding vectors. Euclidean norm is now rank-equivalent to cosine similarity, so no
@@ -105,25 +105,38 @@ class EmbeddingAgent(Agent):
     def known_word(self, word: str):
         return word in self.vocab
 
-    def translate_embedding(self, other_embedding):
-        # If other_embedding is a tesor, it must use the same vocabulary in the same order as self.
+    def translate_embedding(self, other_embedding, subvocab: str or list = None):
+        # If other_embedding is a tesor, it must use the same vocabulary in the same order as self.embeddings
+        # If subvobac is a list, self.vocab must inlude all if its words.
+        if subvocab is None:
+            vocab = self.vocab
+            this_embedding = self.embeddings
+        else:
+            vocab = list(set(rotem_utils.get_vocabulary(subvocab)).intersection(self.vocab)) if isinstance(subvocab, str) else subvocab
+            this_embedding = self.embeddings[[self.word_index_dict[w] for w in vocab]]
+
         if isinstance(other_embedding, str):
             if other_embedding == self.embedding_method:
                 return
-            other_array, *_ = rotem_utils.get_embedder_list_vocab(other_embedding, self.vocab)
+            other_array, *_ = rotem_utils.get_embedder_list_vocab(other_embedding, vocab)
         elif isinstance(other_embedding, torch.Tensor):
+            assert other_embedding.shape[0] == len(vocab), f"{other_embedding.shape[0]=}, {len(vocab)=}"
             other_array = other_embedding.clone().detach()
         else:
             raise ValueError(f"illegal type {type(other_embedding)}, should be str or Tensor")
         # option 1 - closed LS solution
-        T = torch.linalg.lstsq(self.embeddings, other_array)[0]
+        T = torch.linalg.lstsq(this_embedding, other_array)[0]
         self.embeddings = self.embeddings @ T
         ###
         # # option 2 - learnable MLP
-        # T = self.learn_translation_matrix(self.embeddings, other_array)
+        # T = self.learn_translation_matrix(this_embedding, other_array)
         # self.embeddings = T(self.embeddings).detach()
         ###
-        print(f"manually calculated final loss value: {torch.norm(self.embeddings - other_array)}")
+        if self.dist_metric == 'cosine_sim':
+            embedding_norms = torch.norm(self.embeddings, dim=-1, keepdim=True)
+            self.embeddings = self.embeddings / embedding_norms
+        print(f"{len(vocab)=}, embed_dimension={self.embeddings.shape[1]}, norm diff: {torch.norm(self.embeddings[[self.word_index_dict[w] for w in vocab]] - other_array)}")
+
 
     @staticmethod
     def learn_translation_matrix(f_embedding: torch.Tensor, t_embedding: torch.Tensor, lr=0.001, epochs=15):
@@ -175,7 +188,6 @@ class ContextEmbeddingAgent(Agent):
         self.tca = total_cards_amount
         self.model, self.tokenizer = self.initiate_LM(embedding_method)
         self.normalize_embeds = dist_metric == 'cosine_sim'
-        self.known_red_cards = []   # the red cards that the receiver already knows. also used by sender.
 
     def embedder(self, word: List[str] or str, context: str):
         if isinstance(word, str):
@@ -387,6 +399,7 @@ class EmbeddingClusterSender(EmbeddingAgent):
         raise ValueError("illegal reduction method " + self.reduction_method)
 
     def largest_good_cluster(self):
+        gca = self.good_embeds.shape[0]
         largest_cluster_size = 0
         largest_cluster_indices = None
         largest_cluster_centroid = None
@@ -394,7 +407,7 @@ class EmbeddingClusterSender(EmbeddingAgent):
         for cluster_amount in self.cluster_amounts:
             centroids, labels = kmeans2(data, cluster_amount)
             labels = torch.from_numpy(labels)
-            good_cluster_labels = set(labels[:self.gca].tolist()) - set(labels[self.gca:].tolist())
+            good_cluster_labels = set(labels[:gca].tolist()) - set(labels[gca:].tolist())
             for label in good_cluster_labels:
                 indices = (labels == label).nonzero(as_tuple=True)[0]
                 if len(indices) > largest_cluster_size:
@@ -409,7 +422,7 @@ class EmbeddingClusterSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        good_words, bad_words, return_tuple = self.sender_knowledge_forward(words)
         if return_tuple is not None:
             return return_tuple
 
@@ -417,13 +430,18 @@ class EmbeddingClusterSender(EmbeddingAgent):
         self.bad_embeds = self.embedder(bad_words)
 
         centroid, indices, clue_len = self.largest_good_cluster()
-        targets = [good_words[i] for i in indices]
+        try:
+            targets = [good_words[i] for i in indices]
+        except IndexError:
+            print(1)
+
+        centroid, indices, clue_len = self.largest_good_cluster()
         clue_word = self.reduce_cluster(centroid, indices, targets, good_words + bad_words)
 
         return clue_word, clue_len, sorted(targets), {}
 
     def ranked_forward(self, words: tuple, verbose: bool = False):
-        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        good_words, bad_words, return_tuple = self.sender_knowledge_forward(words)
         if return_tuple is not None:
             return return_tuple
         self.good_embeds = self.embedder(good_words)
@@ -471,7 +489,7 @@ class ExhaustiveSearchSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        good_words, bad_words, return_tuple = self.sender_knowledge_forward(words)
         if return_tuple is not None:
             return return_tuple
 
@@ -514,7 +532,7 @@ class ExhaustiveSearchSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        good_words, bad_words, return_tuple = self.sender_knowledge_forward(words)
         if return_tuple is not None:
             return return_tuple
         good_embeds = self.embedder(good_words)
@@ -564,7 +582,7 @@ class CompletelyRandomSender(EmbeddingAgent):
         """
         words = (good_words, bad_words), which are lists of strings.
         """
-        good_words, bad_words, return_tuple = super().sender_knowledge_forward(words)
+        good_words, bad_words, return_tuple = self.sender_knowledge_forward(words)
         if return_tuple is not None:
             return return_tuple
         sample = random.sample(self.vocab, len(good_words) + len(bad_words) + 1)
@@ -573,7 +591,7 @@ class CompletelyRandomSender(EmbeddingAgent):
             if word not in good_words + bad_words:
                 clue_word = word
                 break
-        clue_size = random.sample(range(len(good_words) + len(bad_words)), 1)[0] + 1
+        clue_size = random.sample(range(len(good_words)), 1)[0] + 1
         targets = random.sample(good_words, clue_size)
 
         return clue_word, clue_size, sorted(targets), {}
@@ -595,7 +613,7 @@ class EmbeddingNearestReceiver(EmbeddingAgent):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
+        words, clue_word, clue_amount, board_blue_cards = self.receiver_knowledge_forward(words, clue)
         clue_array = self.embedder(clue_word)
         words_array = self.embedder(words)
         norm_dif = torch.norm(words_array - clue_array, dim=1)
@@ -619,7 +637,7 @@ class EmbeddingNearestReceiver(EmbeddingAgent):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
+        words, clue_word, clue_amount, board_blue_cards = self.receiver_knowledge_forward(words, clue)
         clue_array = self.embedder(clue_word)
         words_array = self.embedder(words)
         norm_diff = torch.norm(words_array - clue_array, dim=1)
@@ -636,7 +654,7 @@ class CompletelyRandomReceiver(EmbeddingAgent):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
+        words, clue_word, clue_amount, board_blue_cards = self.receiver_knowledge_forward(words, clue)
         choice = random.sample(words, clue_amount)
         return board_blue_cards + choice
 
@@ -644,7 +662,7 @@ class CompletelyRandomReceiver(EmbeddingAgent):
         """
         words is a shuffled list of all words, clue is a tuple (word, number).
         """
-        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
+        words, clue_word, clue_amount, board_blue_cards = self.receiver_knowledge_forward(words, clue)
         shuffle = random.sample(words, len(words))
         return board_blue_cards + shuffle
 
@@ -654,7 +672,7 @@ class ContextualizedReceiver(ContextEmbeddingAgent):
         super(ContextualizedReceiver, self).__init__(total_cards, good_cards, embedding_method, vocab, dist_metric)
 
     def forward(self, words: List[str], clue: tuple):
-        words, clue_word, clue_amount, board_blue_cards = super().receiver_knowledge_forward(words, clue)
+        words, clue_word, clue_amount, board_blue_cards = self.receiver_knowledge_forward(words, clue)
         clue_array = self.embedder(clue_word, context=clue_word).view(-1)  # (768)
         assert len(clue_array.shape) == 1
         words_array = self.embedder(words, context=clue_word)  # (N_words, 768)
