@@ -290,7 +290,9 @@ def interactive_game():
                                                                               'max_radius', 'red_blue_diff'])
             elif sender_type == 'cluster':
                 kwargs['reduction_method'] = rotem_utils.user_choice('centroid', "cluster reduction method",
-                                                                     options=['centroid', 'few-shot', 'fusion'])
+                                                                     options=['centroid',
+                                                                              'few-shot-api', 'few-shot-1_token',
+                                                                              'few-shot-greedy', 'fusion'])
             emb_method = rotem_utils.user_choice('GloVe', "sender embedding method", options=['GloVe', 'word2vec'])
             translation_bool = rotem_utils.user_choice('no', "Use translation? (\'yes\' or \'no\')",
                                                        options=['yes', 'no'], full_text=True)
@@ -678,10 +680,13 @@ if __name__ == '__main__':
     # noise_experiment(tca=20, gca=10)
     # rotem_utils.noise_experiment_plots()
 
-    # interactive_game()
+    interactive_game()
 
-    senders_comparison_experiment(tca=20, gca=10, sender_emb_method='GloVe', receiver_emb_method='word2vec',
-                                  one_exhaustive=False)
+    # EvalMeasures.receiver_API(words=['bank', 'crane', 'other', 'words'], clue='river', num_choices=2,
+    #                           targets=['bank', 'crane'], gt_good_words=['bank', 'crane'])
+
+    # senders_comparison_experiment(tca=20, gca=10, sender_emb_method='GloVe', receiver_emb_method='word2vec',
+    #                               one_exhaustive=False)
 
     # game_metric_experiment(tca=30, gca=15, sender_type='exhaustive', receiver_type='embedding',
     #                        sender_emb_method='GloVe', receiver_emb_method='word2vec')

@@ -314,7 +314,7 @@ class EmbeddingClusterSender(EmbeddingAgent):
         #          f"group: " + ', '.join(["\"" + t + "\"" for t in targets]) + ". description: "
         prompt = delimiter.join([f"Words: {', '.join(words)}\nHint: {clue}" for words, clue in [
             (('cat', 'dog', 'mouse'), 'animals'),
-            (('pants', 'shirt', 'hat'), 'cloths'),
+            (('pants', 'shirt', 'hat'), 'clothes'),
             (('one', 'two', 'three', 'four'), 'numbers'),
             (targets, '')
         ]])
@@ -415,7 +415,10 @@ class EmbeddingClusterSender(EmbeddingAgent):
                     largest_cluster_indices = indices
                     largest_cluster_centroid = centroids[label]
         if largest_cluster_size == 0:
-            print("receiver didn't find any cluster!")
+            print("sender didn't find any cluster! taking the first blue word")
+            largest_cluster_size = 1
+            largest_cluster_indices = np.array([0])
+            largest_cluster_centroid = self.good_embeds[0]
         return largest_cluster_centroid, largest_cluster_indices, largest_cluster_size
 
     def forward(self, words: tuple, verbose: bool = False):
